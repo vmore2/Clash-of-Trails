@@ -45,38 +45,12 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
                 attribution: '© OpenStreetMap contributors'
             }).addTo(map);
 
-            // Add user location marker
+            // User location tracking removed - no more red marker
             let userMarker = null;
             let accuracyCircle = null;
             
             function updateUserLocation(lat, lng) {
-                // Remove old markers
-                if (userMarker) {
-                    map.removeLayer(userMarker);
-                }
-                if (accuracyCircle) {
-                    map.removeLayer(accuracyCircle);
-                }
-                
-                // Add new user location marker
-                userMarker = L.circleMarker([lat, lng], {
-                    color: '#007AFF',
-                    fillColor: '#007AFF',
-                    fillOpacity: 0.9,
-                    radius: 10,
-                    weight: 3
-                }).addTo(map);
-                
-                // Add accuracy circle
-                accuracyCircle = L.circle([lat, lng], {
-                    color: '#007AFF',
-                    fillColor: '#007AFF',
-                    fillOpacity: 0.1,
-                    weight: 1,
-                    radius: 15 // 15 meter accuracy estimate
-                }).addTo(map);
-                
-                console.log('WebMap: Updated user location to', lat, lng);
+                // Location tracking disabled - no visual marker
             }
 
             let hexagonLayers = [];
@@ -86,10 +60,7 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
                 hexagonLayers.forEach(layer => map.removeLayer(layer));
                 hexagonLayers = [];
 
-                console.log('WebMap: Updating hexagons, count:', hexagons.length);
-                
                 if (hexagons.length === 0) {
-                    console.log('WebMap: No hexagons to render');
                     return;
                 }
 
@@ -102,15 +73,10 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
                                 if (coord && typeof coord.latitude === 'number' && typeof coord.longitude === 'number') {
                                     return [coord.latitude, coord.longitude];
                                 }
-                                console.log('WebMap: Invalid coord:', coord);
                                 return null;
                             }).filter(Boolean);
                             
-                            if (index === 0) {
-                                console.log('WebMap: First hex coords sample:', hex.coords.slice(0, 2));
-                                console.log('WebMap: Converted to:', leafletCoords.slice(0, 2));
-                                console.log('WebMap: Hex style:', { fill: hex.fill, stroke: hex.stroke, strokeWidth: hex.strokeWidth });
-                            }
+
                             
                             if (leafletCoords.length >= 3) {
                                                         // Enhanced styling based on hex type
@@ -212,30 +178,26 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
                                 console.log('WebMap: Not enough valid coords for hex', index);
                             }
                         } catch (error) {
-                            console.log('WebMap: Error adding hex', index, error);
+                            // Silently handle error for production
                         }
                     }
                 });
-                console.log('WebMap: Added', hexagonLayers.length, 'hexagon layers');
             }
 
             // Listen for messages from React Native
             document.addEventListener('message', function(event) {
                 try {
                     const data = JSON.parse(event.data);
-                    console.log('WebMap received message (document):', data.type, data.hexagons ? data.hexagons.length : 0);
                     if (data.type === 'updateHexagons') {
                         updateHexagons(data.hexagons);
                     } else if (data.type === 'updateCenter') {
-                        console.log('WebMap: Updating center to:', data.region);
                         map.setView([data.region.latitude, data.region.longitude], 15);
                         updateUserLocation(data.region.latitude, data.region.longitude);
                     } else if (data.type === 'updateUserLocation') {
-                        console.log('WebMap: Updating user location to:', data.lat, data.lng);
                         updateUserLocation(data.lat, data.lng);
                     }
                 } catch (error) {
-                    console.log('WebMap message parse error:', error);
+                    // Silently handle error for production
                 }
             });
             
@@ -243,19 +205,16 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
             window.addEventListener('message', function(event) {
                 try {
                     const data = JSON.parse(event.data);
-                    console.log('WebMap received message (window):', data.type, data.hexagons ? data.hexagons.length : 0);
                     if (data.type === 'updateHexagons') {
                         updateHexagons(data.hexagons);
                     } else if (data.type === 'updateCenter') {
-                        console.log('WebMap: Updating center to:', data.region);
                         map.setView([data.region.latitude, data.region.longitude], 15);
                         updateUserLocation(data.region.latitude, data.region.longitude);
                     } else if (data.type === 'updateUserLocation') {
-                        console.log('WebMap: Updating user location to:', data.lat, data.lng);
                         updateUserLocation(data.lat, data.lng);
                     }
                 } catch (error) {
-                    console.log('WebMap message parse error:', error);
+                    // Silently handle error for production
                 }
             });
 
@@ -276,7 +235,6 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
             });
 
             // Remove test square since hexagons are working now
-            console.log('WebMap: Ready for hexagon rendering');
 
             // Set initial user location
             updateUserLocation(${region.latitude}, ${region.longitude});

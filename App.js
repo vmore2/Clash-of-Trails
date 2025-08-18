@@ -9,6 +9,7 @@ import {
   TextInput,
   View,
   Pressable,
+  TouchableOpacity,
   StyleSheet,
   KeyboardAvoidingView,
   Platform,
@@ -16,6 +17,8 @@ import {
   Animated,
   Easing,
   Switch,
+  AppState,
+  PanResponder,
 } from 'react-native';
 import MapView, { Polygon, Marker } from 'react-native-maps';
 import WebMapView from './WebMapView';
@@ -24,6 +27,9 @@ import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as h3 from 'h3-js';
 import { supabase } from './lib/supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import HealthProfileSetup from './HealthProfileSetup';
+import * as Updates from 'expo-updates';
 
 /* ------------------ CONFIG ------------------ */
 const H3_RES = 9; // bigger hexes for outdoor territory claiming (trail-scale)
@@ -49,7 +55,39 @@ function hexToRgb(hex){
   const ok = h.length === 6 ? h : '6aa2ff';
   return { r: parseInt(ok.slice(0,2),16), g: parseInt(ok.slice(2,4),16), b: parseInt(ok.slice(4,6),16) };
 }
-function rgba(hex, alpha){ const {r,g,b} = hexToRgb(hex); return `rgba(${r},${g},${b},${clamp(alpha,0,1)})`; }
+function rgba(hex, alpha){ 
+  const {r,g,b} = hexToRgb(hex); 
+  // For Android compatibility, return rgba strings for WebMapView
+  if (Platform.OS === 'android') {
+    // Return rgba string for WebMapView compatibility
+    return `rgba(${r},${g},${b},${clamp(alpha,0,1)})`;
+  }
+  return `rgba(${r},${g},${b},${clamp(alpha,0,1)})`; 
+}
+
+// Android-compatible color helper for WebMapView (returns rgba strings for consistency)
+function androidColor(hex, alpha) {
+  if (Platform.OS === 'android') {
+    const {r,g,b} = hexToRgb(hex);
+    // Android needs higher alpha values for better visibility
+    const adjustedAlpha = Math.min(alpha * 1.3, 1.0); // Boost alpha by 30% for Android
+    // Return rgba string for WebMapView compatibility
+    return `rgba(${r},${g},${b},${clamp(adjustedAlpha,0,1)})`;
+  }
+  return hex; // iOS can handle hex colors fine
+}
+
+// Android-compatible stroke color helper for WebMapView (returns rgba strings for consistency)
+function androidStrokeColor(hex, alpha) {
+  if (Platform.OS === 'android') {
+    const {r,g,b} = hexToRgb(hex);
+    // Android stroke colors need to be more visible
+    const adjustedAlpha = Math.min(alpha * 1.5, 1.0); // Boost alpha by 50% for Android strokes
+    // Return rgba string for WebMapView compatibility
+    return `rgba(${r},${g},${b},${clamp(adjustedAlpha,0,1)})`;
+  }
+  return hex; // iOS can handle hex colors fine
+}
 function polygonFromCell(h3id){
   try{
     const boundary = h3.cellToBoundary(h3id);
@@ -58,54 +96,71 @@ function polygonFromCell(h3id){
     coords.push({ ...coords[0] }); // Close the polygon
     return coords;
   }catch(e){ 
-    console.log('polygonFromCell error:', e);
     return null; 
   }
 }
 function useTheme(isDark){
   return {
     isDark,
-    bg: isDark ? '#0b0e1a' : '#f6f7fb',
+    bg: isDark ? '#0b0e1a' : '#f5f6fa',
     card: isDark ? '#161a2b' : '#ffffff',
-    border: isDark ? '#1f2338' : '#e7e9f1',
-    text: isDark ? '#ffffff' : '#111322',
-    sub: isDark ? '#9aa0bb' : '#5b6076',
+    border: isDark ? '#1f2338' : '#e1e5f0',
+    text: isDark ? '#ffffff' : '#1a1d2e',
+    sub: isDark ? '#9aa0bb' : '#4a4f6a',
     primary: '#4f7df3',
-    ghostText: isDark ? '#cbd0e6' : '#2b2f44',
-    ghostBorder: isDark ? '#3a3f5a' : '#ccd2ea',
+    ghostText: isDark ? '#cbd0e6' : '#3a3f5a',
+    ghostBorder: isDark ? '#3a3f5a' : '#d1d8f0',
     danger: '#e25555',
-    headerGrad: isDark ? ['#141a2e','#0f1220'] : ['#e8ecff','#e9ebf7'],
+    headerGrad: isDark ? ['#141a2e','#0f1220'] : ['#eef2ff','#e8ecff'],
   };
 }
 
 /* ------------------ UI ATOMS ------------------ */
-const BrandHeader = ({ subtitle, onOpenGroups, onOpenLeaderboard, theme, showGroupsButton, showLeaderboardButton }) => (
-  <LinearGradient colors={theme.headerGrad} style={[styles.header, { borderBottomColor: theme.border }]}>
-    <View style={{flexDirection:'row', alignItems:'center', justifyContent:'space-between'}}>
-      {showGroupsButton ? (
-        <Pressable onPress={onOpenGroups} style={[styles.headerButton, { borderColor: theme.ghostBorder }]}>
-          <Text style={[styles.headerButtonText, { color: theme.ghostText }]}>☰ Groups</Text>
-        </Pressable>
-      ) : <View style={{width:96}}/>}
-      <View style={{alignItems:'center', flex:1}}>
-        <Text style={[styles.brand, { color: theme.text }]}>Clash of Trails</Text>
-        {subtitle ? <Text style={[styles.subtitle, { color: theme.sub }]}>{subtitle}</Text> : null}
+const BrandHeader = ({ subtitle, onOpenGroups, onOpenLeaderboard, onOpenProfile, theme, showGroupsButton, showLeaderboardButton, showProfileButton, conquestMode, sharedHexagonsCount }) => (
+  <View style={[
+    styles.header, 
+    { 
+      backgroundColor: theme.isDark ? 'rgba(22, 26, 43, 0.95)' : 'rgba(248, 250, 255, 0.95)',
+      borderBottomColor: theme.isDark ? 'rgba(79, 125, 243, 0.2)' : 'rgba(79, 125, 243, 0.15)',
+      borderBottomWidth: 1,
+      shadowColor: theme.isDark ? '#000' : '#666',
+      zIndex: 2000,
+      elevation: 2000
+    }
+  ]}>
+    {/* Main header with title */}
+    <View style={{alignItems:'center', paddingTop: Platform.select({ ios: 16, android: 40 }), paddingBottom: 16}}>
+      <Text style={[
+        styles.brand, 
+        { 
+          color: theme.isDark ? '#ffffff' : '#0a0a0a'
+        }
+      ]}>Clash of Trails</Text>
+      {subtitle ? <Text style={[
+        styles.subtitle, 
+        { 
+          color: theme.isDark ? '#cccccc' : '#666666'
+        }
+      ]}>{subtitle}</Text> : null}
+      {conquestMode && (
+        <Text style={[styles.conquestMode, { color: '#ff6b6b', fontWeight: 'bold' }]}>
+          🎯 CONQUEST MODE - Claiming across ALL groups!
+        </Text>
+      )}
       </View>
-      {showLeaderboardButton ? (
-        <Pressable onPress={onOpenLeaderboard} style={[styles.headerButton, { borderColor: theme.ghostBorder }]}>
-          <Text style={[styles.headerButtonText, { color: theme.ghostText }]}>🏆 Board</Text>
-        </Pressable>
-      ) : <View style={{width:96}} />}
     </View>
-  </LinearGradient>
 );
 const Card = ({ children, style, theme }) => (
-  <View style={[styles.card, style, { backgroundColor: theme.card, borderColor: theme.border }]}>{children}</View>
+  <View style={[styles.card, style, { backgroundColor: theme.card, borderColor: theme.border }]}>
+    <View style={styles.cardGlow} />
+    {children}
+  </View>
 );
 const Label = ({ children, theme }) => (
   <Text style={[styles.label, { color: theme.text }]}>{children}</Text>
 );
 const Input = ({ theme, style, ...rest }) => (
+  <View style={styles.inputContainer}>
   <TextInput
     placeholderTextColor={theme.sub}
     {...rest}
@@ -115,6 +170,8 @@ const Input = ({ theme, style, ...rest }) => (
       { backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', color: theme.text, borderColor: theme.border }
     ]}
   />
+    <View style={[styles.inputGlow, { backgroundColor: theme.isDark ? 'rgba(79, 125, 243, 0.1)' : 'rgba(79, 125, 243, 0.05)' }]} />
+  </View>
 );
 const PrimaryButton = ({ title, onPress, disabled, theme }) => (
   <Pressable
@@ -123,8 +180,9 @@ const PrimaryButton = ({ title, onPress, disabled, theme }) => (
       styles.buttonPrimary,
       { backgroundColor: theme.primary },
       disabled && { opacity:.45 },
-      pressed && { transform:[{scale:.98}] },
+      pressed && { transform:[{scale:0.95}] },
     ]}>
+    <View style={styles.buttonPrimaryGradient} />
     <Text style={styles.buttonPrimaryText}>{title}</Text>
   </Pressable>
 );
@@ -137,52 +195,130 @@ const GhostButton = ({ title, onPress, danger, theme, mild }) => (
         borderColor: danger ? theme.danger : theme.ghostBorder,
         backgroundColor: mild ? (theme.isDark ? '#131933' : '#eef1ff') : 'transparent'
       },
-      pressed && { transform:[{scale:.98}] },
+      pressed && { transform:[{scale:0.95}] },
     ]}>
     <Text style={[styles.buttonGhostText, { color: danger ? theme.danger : theme.ghostText }]}>{title}</Text>
   </Pressable>
 );
 
+const CoolButton = ({ title, onPress, theme, type = 'refresh' }) => (
+  <Pressable
+    onPress={async()=>{ await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); onPress?.(); }}
+    style={({pressed})=>[
+      styles.coolButton,
+      {
+        backgroundColor: type === 'refresh' ? theme.primary : theme.danger,
+        transform: [
+          { scale: pressed ? 0.95 : 1 }
+        ]
+      }
+    ]}>
+    <View style={styles.coolButtonGradient} />
+    <Text style={styles.coolButtonText}>{title}</Text>
+  </Pressable>
+);
+
 /* ------------------ LEADERBOARD DRAWER ------------------ */
-function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupId }) {
+function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupId, memberHexCounts, isLoading }) {
   const translateX = useRef(new Animated.Value(400)).current;
+  
+
   
   useEffect(() => {
     Animated.timing(translateX, {
       toValue: visible ? 0 : 400,
-      duration: 220,
+      duration: 150,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true
     }).start();
   }, [visible]);
 
+  // Sort members by hex count (highest first)
+  const sortedMembers = [...groupMembers].sort((a, b) => {
+    const aCount = memberHexCounts[a.userId] || 0;
+    const bCount = memberHexCounts[b.userId] || 0;
+    return bCount - aCount; // Descending order
+  });
+  
+
+
   return (
     <Animated.View pointerEvents={visible ? 'auto':'none'} style={[styles.drawerWrapRight, { transform:[{ translateX }] }]}>
-      <View style={[styles.drawer, { backgroundColor: theme.card, borderColor: theme.border, paddingTop: Platform.select({ ios: 44, android: 24 }) }]}>
-        <View style={[styles.drawerHeader, { borderBottomColor: theme.border }]}>
-          <Text style={[styles.drawerTitle, { color: theme.text }]}>Leaderboard</Text>
-          <Pressable onPress={onClose} style={[styles.drawerClose, { borderColor: theme.ghostBorder }]}>
-            <Text style={{color: theme.ghostText, fontWeight:'800'}}>Close</Text>
-          </Pressable>
+      <View style={[styles.drawer, { backgroundColor: theme.card, borderColor: theme.border, paddingTop: Platform.select({ ios: 44, android: 60 }) }]}>
+        <View style={[styles.drawerHeader, { borderBottomColor: theme.border, zIndex: 3002, elevation: 3002 }]}>
+          <Text style={[styles.drawerTitle, { color: theme.text }]}>🏆 Leaderboard</Text>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <Pressable 
+              onPress={onClose} 
+              style={[
+                styles.drawerClose, 
+                { 
+                  borderColor: '#ff4757'
+                }
+              ]}
+            >
+              <Text style={{color: 'white', fontWeight:'900', fontSize: 18}}>✕</Text>
+            </Pressable>
+          </View>
         </View>
 
         <ScrollView contentContainerStyle={{ padding: 16, gap: 8 }}>
           {!activeGroupId ? (
             <Text style={[styles.cardHint, { color: theme.sub }]}>No active group selected</Text>
+          ) : isLoading ? (
+            <View style={{ alignItems: 'center', padding: 20 }}>
+              <Text style={[styles.cardHint, { color: theme.sub }]}>🔄 Loading leaderboard...</Text>
+            </View>
           ) : groupMembers.length === 0 ? (
             <Text style={[styles.cardHint, { color: theme.sub }]}>No members found</Text>
           ) : (
-            groupMembers.map((member, index) => (
+            <>
+              {/* Member Rankings */}
+              {sortedMembers.map((member, index) => {
+                const hexCount = memberHexCounts[member.userId] || 0;
+                const rank = index + 1;
+                const isTop3 = rank <= 3;
+                
+                return (
               <View key={member.userId} style={[
                 styles.memberRow,
-                { backgroundColor: theme.isDark ? '#0f1324' : '#eef1ff', borderColor: theme.border }
-              ]}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    { 
+                      backgroundColor: theme.isDark ? '#0f1324' : '#eef1ff', 
+                      borderColor: theme.border,
+                      borderWidth: isTop3 ? 2 : 1,
+                      borderColor: isTop3 ? theme.primary : theme.border
+                    }
+                  ]}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
                   <View style={{
-                    width: 12,
-                    height: 12,
-                    borderRadius: 6,
-                    backgroundColor: member.color
+                        width: 24,
+                        height: 24,
+                        borderRadius: 12,
+                        backgroundColor: isTop3 ? theme.primary : theme.sub,
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}>
+                        <Text style={{ 
+                          color: theme.card, 
+                          fontSize: 12, 
+                          fontWeight: 'bold' 
+                        }}>
+                          {rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : rank}
+                        </Text>
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <View style={{
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 8
+                        }}>
+                          <View style={{
+                            width: 16,
+                            height: 16,
+                            borderRadius: 8,
+                            backgroundColor: member.color,
+                            borderWidth: 2,
+                            borderColor: theme.card
                   }} />
                   <Text style={[styles.memberName, { color: theme.text }]}>
                     {member.displayName}
@@ -191,9 +327,30 @@ function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupI
                     <Text style={{ color: theme.primary, fontSize: 10, fontWeight: '600' }}>OWNER</Text>
                   )}
                 </View>
-                <Text style={{ color: theme.sub, fontSize: 12 }}>#{index + 1}</Text>
               </View>
-            ))
+                    </View>
+                    <View style={{ alignItems: 'flex-end' }}>
+                      <Text style={{ color: theme.primary, fontSize: 16, fontWeight: 'bold' }}>
+                        {hexCount}
+                      </Text>
+                      <Text style={{ color: theme.sub, fontSize: 10 }}>
+                        {hexCount === 1 ? 'hex' : 'hexes'}
+                      </Text>
+                      {/* Territory color indicator */}
+                      <View style={{
+                        width: 20,
+                        height: 20,
+                        borderRadius: 10,
+                        backgroundColor: member.color,
+                        borderWidth: 2,
+                        borderColor: theme.card,
+                        marginTop: 4
+                      }} />
+                    </View>
+                  </View>
+                );
+              })}
+            </>
           )}
         </ScrollView>
       </View>
@@ -201,23 +358,307 @@ function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupI
   );
 }
 
+/* ------------------ PROFILE SECTION ------------------ */
+function ProfileSection({ theme, user, profile, onProfileUpdate, onOpenHealthSetup }) {
+  const [displayName, setDisplayName] = useState(profile?.display_name || '');
+  const [selectedColor, setSelectedColor] = useState(profile?.color || '#6aa2ff');
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [updateError, setUpdateError] = useState('');
+  const [updateSuccess, setUpdateSuccess] = useState('');
+
+  // Update local state when profile changes
+  useEffect(() => {
+    setDisplayName(profile?.display_name || '');
+    setSelectedColor(profile?.color || '#6aa2ff');
+  }, [profile]);
+
+  const colors = [
+    '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
+    '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9',
+    '#F8C471', '#82E0AA', '#F1948A', '#E74C3C', '#D7BDE2'
+  ];
+
+  // Check if any changes have been made
+  const hasChanges = () => {
+    const hasDisplayNameChanged = displayName.trim() !== (profile?.display_name || '');
+    const hasColorChanged = selectedColor !== (profile?.color || '#6aa2ff');
+    return hasDisplayNameChanged || hasColorChanged;
+  };
+
+  const updateProfile = async () => {
+    if (!user?.id) {
+      setUpdateError('User not available.');
+      return;
+    }
+    
+    // Check if anything has changed
+    const hasDisplayNameChanged = displayName.trim() !== (profile?.display_name || '');
+    const hasColorChanged = selectedColor !== (profile?.color || '#6aa2ff');
+    
+    if (!hasDisplayNameChanged && !hasColorChanged) {
+      setUpdateError('No changes detected. Please modify at least one field.');
+      return;
+    }
+    
+    setIsUpdating(true);
+    setUpdateError('');
+    
+    try {
+      // Only update fields that have changed
+      const updateData = { id: user.id };
+      if (hasDisplayNameChanged) {
+        updateData.display_name = displayName.trim();
+      }
+      if (hasColorChanged) {
+        updateData.color = selectedColor;
+      }
+      
+      const { data, error } = await supabase
+        .from('profiles')
+        .upsert(updateData, {
+          onConflict: 'id'
+        });
+
+      if (error) {
+        throw error;
+      }
+      
+      // Show success message
+      const changes = [];
+      if (hasDisplayNameChanged) changes.push('display name');
+      if (hasColorChanged) changes.push('color');
+      setUpdateSuccess(`${changes.join(' and ')} updated successfully!`);
+      setUpdateError('');
+      
+      // Refresh profile data
+      onProfileUpdate();
+      
+      // Clear the form
+      setDisplayName(profile?.display_name || '');
+      
+      // Clear success message after 3 seconds
+      setTimeout(() => setUpdateSuccess(''), 3000);
+      
+      // Profile updated successfully - leaderboard will refresh automatically
+      // through the onProfileUpdate callback
+      
+    } catch (error) {
+      setUpdateError(`Failed to update profile: ${error.message || 'Unknown error'}`);
+      setUpdateSuccess('');
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  if (!user) return null;
+
+  return (
+    <View style={{ gap: 20 }}>
+      <View style={{ gap: 12 }}>
+        <Text style={[styles.cardHint, { color: theme.sub }]}>Current User Name</Text>
+        <View style={{
+          backgroundColor: theme.isDark ? '#1a1f2e' : '#f0f2ff',
+          padding: 16,
+          borderRadius: 16,
+          borderWidth: 1,
+          borderColor: theme.border
+        }}>
+          <Text style={[styles.cardTitle, { color: theme.text, fontSize: 18 }]}>{profile?.display_name || 'Not set'}</Text>
+        </View>
+      </View>
+
+      <View style={{ gap: 12 }}>
+        <Text style={[styles.cardHint, { color: theme.sub }]}>New User Name</Text>
+        <Input 
+          theme={theme} 
+          value={""} 
+          onChangeText={setDisplayName}
+          placeholder="Enter user name"
+        />
+      </View>
+
+      <View style={{ gap: 12 }}>
+        <Text style={[styles.cardHint, { color: theme.sub }]}>Current Territory Color</Text>
+        <View style={{
+          backgroundColor: theme.isDark ? '#1a1f2e' : '#f0f2ff',
+          padding: 16,
+          borderRadius: 16,
+          borderWidth: 1,
+          borderColor: theme.border,
+          flexDirection: 'row',
+          alignItems: 'center',
+          gap: 16
+        }}>
+          <View style={{
+            width: 48,
+            height: 48,
+            borderRadius: 24,
+            backgroundColor: profile?.color || '#6aa2ff',
+            borderWidth: 3,
+            borderColor: theme.border,
+            shadowColor: '#000',
+            shadowOpacity: 0.2,
+            shadowRadius: 8,
+            shadowOffset: {width: 0, height: 4},
+            elevation: 6
+          }} />
+          <Text style={[styles.cardTitle, { color: theme.text, fontSize: 16 }]}>{profile?.color || '#6aa2ff'}</Text>
+        </View>
+      </View>
+
+      <View style={{ gap: 12 }}>
+        <Text style={[styles.cardHint, { color: theme.sub }]}>New Territory Color</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }}>
+          {colors.map((color) => (
+            <Pressable
+              key={color}
+              onPress={() => setSelectedColor(color)}
+              style={[
+                {
+                  width: 40,
+                  height: 40,
+                  borderRadius: 20,
+                  backgroundColor: color,
+                  borderWidth: 4,
+                  borderColor: selectedColor === color ? theme.primary : 'transparent',
+                  shadowColor: '#000',
+                  shadowOpacity: 0.2,
+                  shadowRadius: 6,
+                  shadowOffset: {width: 0, height: 3},
+                  elevation: 4
+                }
+              ]}
+            />
+          ))}
+        </View>
+        <Text style={[styles.cardHint, { color: theme.sub, fontSize: 12, fontStyle: 'italic' }]}>
+          💡 Tip: You can update just the color without changing the display name
+        </Text>
+      </View>
+      
+      {/* Health Profile Section */}
+      <View style={{ 
+        borderTopWidth: 1, 
+        borderTopColor: theme.border, 
+        paddingTop: 20, 
+        marginTop: 20 
+      }}>
+        <Text style={[styles.cardTitle, { color: theme.text, fontSize: 18, marginBottom: 16 }]}>
+          🏃‍♂️ Health Profile
+        </Text>
+        
+        {/* Current Health Data Display */}
+        <View style={{ gap: 16, marginBottom: 20 }}>
+          <View style={{ flexDirection: 'row', gap: 12 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardHint, { color: theme.sub, fontSize: 12 }]}>Height</Text>
+              <Text style={[styles.cardTitle, { color: theme.text, fontSize: 16 }]}>
+                {profile?.height_cm ? `${profile.height_cm} cm` : 'Not set'}
+              </Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardHint, { color: theme.sub, fontSize: 12 }]}>Weight</Text>
+              <Text style={[styles.cardTitle, { color: theme.text, fontSize: 16 }]}>
+                {profile?.weight_kg ? `${profile.weight_kg} kg` : 'Not set'}
+              </Text>
+            </View>
+          </View>
+          
+          <View style={{ flexDirection: 'row', gap: 12 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardHint, { color: theme.sub, fontSize: 12 }]}>Age</Text>
+              <Text style={[styles.cardTitle, { color: theme.text, fontSize: 16 }]}>
+                {profile?.age ? `${profile.age} years` : 'Not set'}
+              </Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardHint, { color: theme.sub, fontSize: 12 }]}>Activity Level</Text>
+              <Text style={[styles.cardTitle, { color: theme.text, fontSize: 16 }]}>
+                {profile?.activity_level ? profile.activity_level.charAt(0).toUpperCase() + profile.activity_level.slice(1) : 'Not set'}
+              </Text>
+            </View>
+          </View>
+        </View>
+        
+        {/* Health Profile Update Button */}
+        <Pressable
+          style={[
+            styles.buttonPrimary,
+            { 
+              backgroundColor: theme.isDark ? '#1a1f2e' : '#f0f2ff',
+              borderWidth: 1,
+              borderColor: theme.border
+            }
+          ]}
+          onPress={() => {
+            // Open health setup for existing users to update their data
+            onOpenHealthSetup();
+          }}
+        >
+          <Text style={[styles.buttonPrimaryText, { color: theme.text }]}>
+            Update Health Profile
+          </Text>
+        </Pressable>
+      </View>
+      
+
+
+      {updateError ? (
+        <Text style={[styles.cardHint, { color: theme.danger }]}>{updateError}</Text>
+      ) : null}
+      
+      {updateSuccess ? (
+        <Text style={[styles.cardHint, { color: theme.primary }]}>{updateSuccess}</Text>
+      ) : null}
+
+      <PrimaryButton
+        theme={theme}
+        title={isUpdating ? "Updating..." : "Update Profile"}
+        onPress={updateProfile}
+        disabled={isUpdating || !hasChanges()}
+      />
+    </View>
+  );
+}
+
 /* ------------------ GROUPS DRAWER (DIRECT DB) ------------------ */
-function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, refreshCells, userId }) {
+function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, refreshCells, userId, leaveGroup: onLeaveGroup }) {
   const [groups, setGroups] = useState([]);
   const [newName, setNewName] = useState('My Crew');
   const [joinName, setJoinName] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [longPressedGroup, setLongPressedGroup] = useState(null);
+  const [leaveButtonAnim] = useState(new Animated.Value(0));
 
   const translateX = useRef(new Animated.Value(-400)).current;
   useEffect(() => {
     Animated.timing(translateX, {
       toValue: visible ? 0 : -400,
-      duration: 220,
+      duration: 150,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true
     }).start();
   }, [visible]);
+
+          const fetchProfile = useCallback(async () => {
+      if (!userId) return;
+      
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('display_name, color, height_cm, weight_kg, age, activity_level')
+          .eq('id', userId)
+          .single();
+        
+        if (error) throw error;
+        if (data) setProfile(data);
+        
+      } catch (error) {
+        // Silently handle error for production
+      }
+    }, [userId]);
 
   const fetchGroups = useCallback(async ()=>{
     try {
@@ -229,11 +670,11 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
         return;
       }
 
-      const { data, error } = await supabase
-        .from('group_members')
-        .select('group_id, groups(name)')
-        .eq('user_id', userId)
-        .order('joined_at', { ascending: true });
+    const { data, error } = await supabase
+      .from('group_members')
+      .select('group_id, groups(name)')
+      .eq('user_id', userId)
+      .order('joined_at', { ascending: true });
         
       if (error) {
         throw error;
@@ -252,7 +693,12 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
       setIsLoading(false);
     }
   }, [userId]);
-  useEffect(()=>{ if(visible) fetchGroups(); }, [visible, fetchGroups]);
+  useEffect(()=>{ 
+    if(visible) {
+      fetchGroups();
+      fetchProfile();
+    }
+  }, [visible, fetchGroups, fetchProfile]);
 
   const afterSelect = async (gid) => { 
     try {
@@ -267,6 +713,54 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
     }
   };
 
+  const handleLongPress = (group) => {
+    setLongPressedGroup(group);
+    // Fast spring animation
+    Animated.spring(leaveButtonAnim, {
+      toValue: 1,
+      useNativeDriver: true,
+      tension: 120,
+      friction: 8,
+      restDisplacementThreshold: 0.01,
+      restSpeedThreshold: 0.01,
+    }).start();
+    
+    // Add haptic feedback for better UX
+    if (Platform.OS === 'ios') {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    }
+  };
+
+  const handleLeaveGroup = async (groupId) => {
+    try {
+      await onLeaveGroup(groupId);
+      setLongPressedGroup(null);
+      // Animate the leave button out
+      Animated.timing(leaveButtonAnim, {
+        toValue: 0,
+        duration: 200,
+        useNativeDriver: true,
+      }).start();
+    } catch (error) {
+      // Error is already handled in onLeaveGroup function
+    }
+  };
+
+  const handlePress = (gid) => {
+    // If long press is active, dismiss it and don't select the group
+    if (longPressedGroup) {
+      setLongPressedGroup(null);
+      // Animate the leave button out
+      Animated.timing(leaveButtonAnim, {
+        toValue: 0,
+        duration: 200,
+        useNativeDriver: true,
+      }).start();
+      return;
+    }
+    afterSelect(gid);
+  };
+
   const createGroup = async ()=>{
     try{
       setIsLoading(true);
@@ -275,10 +769,45 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
       const name = newName.trim();
       if (!name) return Alert.alert('Missing name','Enter a group name.');
       
+      // Additional validation
+      if (name.length < 2) return Alert.alert('Name too short','Group name must be at least 2 characters long.');
+      if (name.length > 50) return Alert.alert('Name too long','Group name must be less than 50 characters.');
+      
+      // Check for invalid characters (optional - you can customize this)
+      const invalidChars = /[<>:"/\\|?*]/;
+      if (invalidChars.test(name)) {
+        return Alert.alert('Invalid characters','Group name contains invalid characters. Please use only letters, numbers, spaces, and common punctuation.');
+      }
+      
       // Get current auth user to ensure we have the right ID
       const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
       if (authError) throw new Error('Authentication error: ' + authError.message);
       if (!authUser) throw new Error('Not authenticated');
+      
+      // Check if group name already exists (case-insensitive)
+      const { data: existingGroups, error: checkError } = await supabase
+        .from('groups')
+        .select('id, name')
+        .ilike('name', name); // Case-insensitive search
+      
+      if (checkError) {
+        throw new Error('Failed to check existing groups: ' + checkError.message);
+      }
+      
+      if (existingGroups && existingGroups.length > 0) {
+        throw new Error(`Group name "${name}" already exists. Please choose a different name.`);
+      }
+      
+      // Also check for similar names to help user choose
+      const { data: similarGroups, error: similarError } = await supabase
+        .from('groups')
+        .select('name')
+        .or(`name.ilike.%${name}%,name.ilike.${name}%,name.ilike.%${name}`)
+        .limit(5);
+      
+      if (!similarError && similarGroups && similarGroups.length > 0) {
+        const suggestions = similarGroups.map(g => g.name).join(', ');
+      }
       
       // Ensure profile exists before creating group
       const { error: profileError } = await supabase.from('profiles').upsert({
@@ -298,7 +827,18 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
         created_by: authUser.id 
       }).select('id').single();
       
-      if (groupError) throw new Error('Failed to create group: ' + groupError.message);
+      if (groupError) {
+        // Handle specific database errors
+        if (groupError.code === '23505') {
+          // Unique constraint violation
+          throw new Error(`Group name "${name}" already exists. Please choose a different name.`);
+        } else if (groupError.code === '23503') {
+          // Foreign key constraint violation
+          throw new Error('Failed to create group: Invalid user reference. Please try again.');
+        } else {
+          throw new Error('Failed to create group: ' + groupError.message);
+        }
+      }
       
       const gid = groupData?.id;
       if (!gid) throw new Error('No group id returned');
@@ -310,8 +850,11 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
         role: 'owner'
       });
       
-      if (membershipError) throw new Error('Failed to add membership: ' + membershipError.message);
+      if (membershipError) {
+        throw new Error('Failed to add membership: ' + membershipError.message);
+      }
 
+      // Refresh groups and select the new one
       await fetchGroups();
       onSelectGroup(gid);
       Alert.alert('Group created', `Created and joined "${name}"`);
@@ -393,33 +936,92 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
     }
   };
 
+
+
   return (
     <Animated.View pointerEvents={visible ? 'auto':'none'} style={[styles.drawerWrap, { transform:[{ translateX }] }]}>
-      <View style={[styles.drawer, { backgroundColor: theme.card, borderColor: theme.border, paddingTop: Platform.select({ ios: 44, android: 24 }) }]}>
-        <View style={[styles.drawerHeader, { borderBottomColor: theme.border }]}>
+      <View style={[styles.drawer, { backgroundColor: theme.card, borderColor: theme.border, paddingTop: Platform.select({ ios: 44, android: 60 }) }]}>
+        <View style={[styles.drawerHeader, { borderBottomColor: theme.border, zIndex: 3002, elevation: 3002 }]}>
           <Text style={[styles.drawerTitle, { color: theme.text }]}>Your Groups</Text>
-          <Pressable onPress={onClose} style={[styles.drawerClose, { borderColor: theme.ghostBorder }]}><Text style={{color: theme.ghostText, fontWeight:'800'}}>Close</Text></Pressable>
+          <Pressable 
+            onPress={onClose} 
+            style={[
+              styles.drawerClose, 
+              { 
+                borderColor: '#ff4757'
+              }
+            ]}
+          >
+            <Text style={{color: 'white', fontWeight:'900', fontSize: 18}}>✕</Text>
+          </Pressable>
         </View>
 
         <ScrollView contentContainerStyle={{ padding: 16, gap: 10 }}>
-          {/* Debug info */}
-          <View style={{ padding: 8, backgroundColor: theme.isDark ? '#1a1f2e' : '#f0f2ff', borderRadius: 8, borderWidth: 1, borderColor: theme.border }}>
-            <Text style={[styles.sectionTitle, { color: theme.sub, fontSize: 12 }]}>Debug Info</Text>
-            <Text style={[styles.cardHint, { color: theme.sub }]}>User ID: {userId || 'None'}</Text>
-            <Text style={[styles.cardHint, { color: theme.sub }]}>Active Group: {activeGroupId || 'None'}</Text>
-            <Text style={[styles.cardHint, { color: theme.sub }]}>Groups Count: {groups.length}</Text>
-            {isLoading && <Text style={[styles.cardHint, { color: theme.primary }]}>Loading...</Text>}
-            {error && <Text style={[styles.cardHint, { color: theme.danger }]}>Error: {error}</Text>}
-          </View>
+
 
           {groups.map(g => (
-            <Pressable key={g.id} onPress={()=>afterSelect(g.id)} style={[
+            <View key={g.id} style={{ position: 'relative' }}>
+              <Pressable 
+                onPress={() => handlePress(g.id)}
+                onLongPress={() => handleLongPress(g)}
+                style={[
               styles.groupRow,
-              { backgroundColor: theme.isDark ? '#0f1324' : '#eef1ff', borderColor: activeGroupId===g.id ? theme.primary : theme.border }
-            ]}>
+                  { 
+                    backgroundColor: theme.isDark ? '#0f1324' : '#eef1ff', 
+                    borderColor: activeGroupId===g.id ? theme.primary : theme.border,
+                    // Add subtle highlight when long pressed
+                    opacity: longPressedGroup?.id === g.id ? 0.95 : 1,
+                    transform: [
+                      {
+                        scale: longPressedGroup?.id === g.id ? 0.99 : 1
+                      }
+                    ],
+                    // Add border highlight when long pressed
+                    borderWidth: longPressedGroup?.id === g.id ? 1.5 : 1,
+                    borderColor: longPressedGroup?.id === g.id ? '#ff4757' : (activeGroupId===g.id ? theme.primary : theme.border)
+                  }
+                ]}
+              >
               <Text style={[styles.groupName, { color: theme.text }]}>{g.name}</Text>
               {activeGroupId===g.id ? <Text style={{ color: theme.primary, fontWeight:'800' }}>Active</Text> : null}
             </Pressable>
+              
+              {/* Cool Animated Leave Button - Below Group Row */}
+              {longPressedGroup?.id === g.id && (
+                <Animated.View
+                  style={[
+                    styles.leaveButtonContainerBelow,
+                    {
+                      opacity: leaveButtonAnim,
+                      transform: [
+                        {
+                          scale: leaveButtonAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [0.5, 1]
+                          })
+                        },
+                        {
+                          translateY: leaveButtonAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [20, 0]
+                          })
+                        }
+                      ]
+                    }
+                  ]}
+                >
+                  <Pressable
+                    onPress={() => handleLeaveGroup(g.id)}
+                    style={[
+                      styles.leaveButton,
+                      { backgroundColor: '#ff4757', borderColor: '#ff4757' }
+                    ]}
+                  >
+                    <Text style={styles.leaveButtonText}>🚪 Leave Group</Text>
+                  </Pressable>
+                </Animated.View>
+              )}
+            </View>
           ))}
 
           <View style={[styles.sectionDivider, { backgroundColor: theme.border }]}/>
@@ -432,18 +1034,7 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
           <Input theme={theme} value={joinName} onChangeText={setJoinName} autoCapitalize="none" placeholder="Exact group name"/>
           <GhostButton theme={theme} title={isLoading ? "Joining..." : "Join"} onPress={joinByName} disabled={isLoading}/>
           
-          {/* Test buttons */}
-          <View style={[styles.sectionDivider, { backgroundColor: theme.border }]}/>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>Debug Actions</Text>
-          <GhostButton theme={theme} title="Test DB Connection" onPress={async () => {
-            try {
-              const { data, error } = await supabase.from('groups').select('count').limit(1);
-              console.log('DB test result:', { data, error });
-              Alert.alert('DB Test', error ? 'Failed: ' + error.message : 'Success!');
-            } catch (e) {
-              Alert.alert('DB Test', 'Error: ' + e.message);
-            }
-          }} mild />
+
           <GhostButton theme={theme} title="Refresh Groups" onPress={fetchGroups} mild />
         </ScrollView>
       </View>
@@ -454,13 +1045,10 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
 /* ------------------ CAPTURE WRITERS ------------------ */
 async function captureCells(cells, groupId, userId) {
   if (!cells || cells.length === 0 || !groupId || !userId) {
-    console.log('captureCells: Missing required parameters', { cells: cells?.length, groupId, userId });
     return;
   }
   
   try {
-    console.log('Capturing cells:', cells.length, 'for group:', groupId, 'user:', userId);
-    
     // Use the modern schema with user_id
     const cellData = cells.map(cell => ({
       h3_id: cell,
@@ -476,26 +1064,16 @@ async function captureCells(cells, groupId, userId) {
       });
 
     if (error) {
-      console.log('captureCells database error:', error);
-      
       // If it's a schema error, try to understand what's wrong
       if (error.code === '42703') {
-        console.log('Schema error - checking table structure');
         const { data: columns, error: schemaError } = await supabase
           .rpc('get_table_columns', { table_name: 'captured_cells' });
-        
-        if (!schemaError && columns) {
-          console.log('Table columns:', columns);
-        }
       }
       
       throw error;
     }
-
-    console.log('Successfully captured', cells.length, 'cells for group', groupId);
     
   } catch (error) {
-    console.log('captureCells error:', error);
     throw error;
   }
 }
@@ -506,9 +1084,8 @@ async function captureTerritoryGlobal(points, groupId, userId) {
     for (const p of points) uniq.add(h3.latLngToCell(p.lat, p.lon, H3_RES));
     const cells = Array.from(uniq);
     await captureCells(cells, groupId, userId);
-    console.log('captureTerritoryGlobal wrote', cells.length, 'cells');
   } catch (e) {
-    console.log('captureTerritoryGlobal error:', e?.message || String(e));
+    // Silently handle error for production
   }
 }
 
@@ -528,10 +1105,14 @@ export default function App(){
   const [activeGroupId, setActiveGroupId] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [leaderboardOpen, setLeaderboardOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const [groupMembers, setGroupMembers] = useState([]);
+  const [isLeaderboardLoading, setIsLeaderboardLoading] = useState(false);
+  const [groups, setGroups] = useState([]);
 
   // tracking
   const [isTracking,setIsTracking]=useState(false);
+  const [conquestMode, setConquestMode] = useState(false); // New conquest mode state
   const [points,setPoints]=useState([]);
   const [startTime,setStartTime]=useState(0);
   const [elapsed,setElapsed]=useState(0);
@@ -544,6 +1125,25 @@ export default function App(){
   const [cells, setCells] = useState([]);
   const [allHexGrid, setAllHexGrid] = useState(new Set()); // Persistent hex grid
   const [claimedCells, setClaimedCells] = useState(new Set()); // Track claimed cells
+  const [memberHexCounts, setMemberHexCounts] = useState({}); // Track hex counts for each member
+  const [sharedHexagons, setSharedHexagons] = useState(new Map()); // Track shared hexagons for visual display
+  const [localClaimedHexes, setLocalClaimedHexes] = useState(new Set()); // Local hexes while walking
+  const [dailySteps, setDailySteps] = useState(0);
+  const [dailyCalories, setDailyCalories] = useState(0);
+  const [selectedHexInfo, setSelectedHexInfo] = useState(null);
+  const [hexInfoModalVisible, setHexInfoModalVisible] = useState(false);
+  const [showHealthSetup, setShowHealthSetup] = useState(false);
+  const [hasCompletedHealthSetup, setHasCompletedHealthSetup] = useState(false);
+  const [hasShownHealthSetup, setHasShownHealthSetup] = useState(false);
+  const [pedometerAvailable, setPedometerAvailable] = useState(false);
+  const [realStepCount, setRealStepCount] = useState(0);
+  const [realCalories, setRealCalories] = useState(0);
+  
+  // OTA Update checking
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  
+
 
 
   // live capture throttle + debounce
@@ -552,17 +1152,322 @@ export default function App(){
   const fetchCellsTimer = useRef(null);
   const lastGridUpdateRef = useRef(0);
   const lastGridExpansionRef = useRef(0);
+  const gridExpansionTimeoutRef = useRef(null);
   const locationIntervalRef = useRef(null); // New ref for setInterval
   const locationCounterRef = useRef(0); // Counter for location updates
   const isTrackingRef = useRef(false); // Ref to track tracking state
 
-  // bottom sheet
+  // Enhanced bottom sheet with pull-up functionality
   const sheetY = useRef(new Animated.Value(0)).current;
-  const toggleSheet = () => {
-    const current = typeof sheetY.__getValue === 'function' ? sheetY.__getValue() : 0;
-    Animated.timing(sheetY, { toValue: current > 0.5 ? 0 : 1, duration: 250, easing: Easing.out(Easing.cubic), useNativeDriver: false }).start();
+  const sheetHeight = useRef(new Animated.Value(200)).current;
+  const isExpanded = useRef(false);
+  
+  // Hex info modal functionality
+  const handleHexTap = async (hexId) => {
+    try {
+      // First get the captured cells data
+      const { data: hexData, error: hexError } = await supabase
+        .from('captured_cells')
+        .select('h3_id, group_id, user_id, captured_at')
+        .eq('h3_id', hexId)
+        .eq('group_id', activeGroupId);
+      
+      if (hexError) throw hexError;
+      
+      if (hexData && hexData.length > 0) {
+        // Get user profiles for the hex owners
+        const userIds = hexData.map(item => item.user_id);
+        const { data: profileData, error: profileError } = await supabase
+          .from('profiles')
+          .select('id, display_name, color')
+          .in('id', userIds);
+        
+        if (profileError) throw profileError;
+        
+        // Check if it's a shared hex (multiple users)
+        const isShared = hexData.length > 1;
+        
+        // Combine hex data with profile data
+        const owners = hexData.map(hexItem => {
+          const profile = profileData.find(p => p.id === hexItem.user_id);
+          return {
+            displayName: profile?.display_name || 'Unknown User',
+            color: profile?.color || '#6aa2ff',
+            capturedAt: hexItem.captured_at
+          };
+        });
+        
+        setSelectedHexInfo({
+          hexId,
+          isShared,
+          owners,
+          groupName: groups.find(g => g.id === activeGroupId)?.name || 'Unknown Group'
+        });
+        
+        setHexInfoModalVisible(true);
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      }
+    } catch (error) {
+      console.error('Error fetching hex info:', error);
+    }
   };
-  const sheetHeight = sheetY.interpolate({ inputRange: [0,1], outputRange: [200, 420] });
+  
+  // Modal animation values
+  const modalOpacity = useRef(new Animated.Value(0)).current;
+  const modalScale = useRef(new Animated.Value(0.8)).current;
+  
+  // Health tracking setup
+  useEffect(() => {
+    const checkPedometerAvailability = async () => {
+      try {
+        const isAvailable = await Pedometer.isAvailableAsync();
+        setPedometerAvailable(isAvailable);
+      } catch (error) {
+        setPedometerAvailable(false);
+      }
+    };
+    
+    checkPedometerAvailability();
+  }, []);
+  
+  // OTA Update checking
+  useEffect(() => {
+    const checkForUpdates = async () => {
+      try {
+        setIsCheckingUpdate(true);
+        const update = await Updates.checkForUpdateAsync();
+        if (update.isAvailable) {
+          setUpdateAvailable(true);
+          console.log('🔄 Update available!');
+        }
+      } catch (error) {
+        console.log('Update check failed:', error);
+      } finally {
+        setIsCheckingUpdate(false);
+      }
+    };
+    
+    // Check for updates when app starts
+    checkForUpdates();
+    
+    // Check for updates every 30 minutes
+    const updateInterval = setInterval(checkForUpdates, 30 * 60 * 1000);
+    
+    return () => clearInterval(updateInterval);
+  }, []);
+  
+  // OTA Update functions
+  const applyUpdate = useCallback(async () => {
+    try {
+      setUpdateAvailable(false);
+      setIsCheckingUpdate(true);
+      
+      const result = await Updates.fetchUpdateAsync();
+      if (result.isNew) {
+        await Updates.reloadAsync();
+      }
+    } catch (error) {
+      console.log('Update failed:', error);
+      setUpdateAvailable(true); // Re-enable update button
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  }, []);
+  
+  // Real-time health tracking
+  const startHealthTracking = useCallback(async () => {
+    if (!pedometerAvailable || !isTracking) return;
+    
+    try {
+      const subscription = Pedometer.watchStepCount((result) => {
+        if (result.steps !== null) {
+          setRealStepCount(prev => prev + 1);
+          // Calculate calories based on user profile and real steps
+          calculateRealCalories(result.steps);
+        }
+      });
+      
+      return subscription;
+    } catch (error) {
+      // Silently handle error for production
+    }
+  }, [pedometerAvailable, isTracking]);
+  
+  const calculateRealCalories = useCallback((steps) => {
+    if (!profile) return;
+    
+    // Get user metrics
+    const weightKg = profile.weight_kg || 70;
+    const heightCm = profile.height_cm || 170;
+    const age = profile.age || 25;
+    const activityLevel = profile.activity_level || 'moderate';
+    
+    // Calculate calories using real step data and user profile
+    // Based on MET values and user characteristics
+    const stepLength = heightCm * 0.414; // cm per step
+    const distanceM = steps * stepLength / 100; // meters
+    const distanceKm = distanceM / 1000;
+    
+    // MET values based on walking speed (assuming moderate pace)
+    const metValue = 3.5; // Moderate walking
+    
+    // Calculate calories: Calories = MET × Weight (kg) × Time (hours)
+    // For steps, we estimate time based on average walking speed
+    const avgSpeedKmh = 5; // 5 km/h average walking speed
+    const timeHours = distanceKm / avgSpeedKmh;
+    
+    const calories = metValue * weightKg * timeHours;
+    
+    setRealCalories(prev => Math.round(prev + calories));
+  }, [profile]);
+  
+  const stopHealthTracking = useCallback(() => {
+    // Pedometer subscription cleanup is handled automatically
+    setRealStepCount(0);
+    setRealCalories(0);
+  }, []);
+  
+  // Check if user has completed health setup
+  useEffect(() => {
+    if (user && profile) {
+      const hasHealthData = profile.height_cm && profile.weight_kg && profile.age;
+      setHasCompletedHealthSetup(!!hasHealthData);
+      
+      // Only show health setup for new users, and only once per session
+      const isNewUser = !profile.display_name || profile.display_name === 'Player';
+      if (!hasHealthData && isNewUser && !hasShownHealthSetup) {
+        setShowHealthSetup(true);
+        setHasShownHealthSetup(true); // Mark as shown for this session
+      }
+    }
+  }, [user, profile, hasShownHealthSetup]);
+  
+  // Start/stop health tracking based on isTracking state
+  useEffect(() => {
+    if (isTracking && pedometerAvailable) {
+      startHealthTracking();
+    } else if (!isTracking) {
+      stopHealthTracking();
+    }
+  }, [isTracking, pedometerAvailable, startHealthTracking, stopHealthTracking]);
+  
+  // Animate modal in/out
+  useEffect(() => {
+    if (hexInfoModalVisible) {
+      Animated.parallel([
+        Animated.timing(modalOpacity, {
+          toValue: 1,
+          duration: 300,
+          useNativeDriver: false,
+        }),
+        Animated.spring(modalScale, {
+          toValue: 1,
+          tension: 100,
+          friction: 8,
+          useNativeDriver: false,
+        })
+      ]).start();
+    } else {
+      Animated.parallel([
+        Animated.timing(modalOpacity, {
+          toValue: 0,
+          duration: 200,
+          useNativeDriver: false,
+        }),
+        Animated.spring(modalScale, {
+          toValue: 0.8,
+          tension: 100,
+          friction: 8,
+          useNativeDriver: false,
+        })
+      ]).start();
+    }
+  }, [hexInfoModalVisible]);
+  
+  const toggleSheet = () => {
+    const targetHeight = isExpanded.current ? 200 : 400;
+    isExpanded.current = !isExpanded.current;
+    
+    Animated.spring(sheetHeight, {
+      toValue: targetHeight,
+      tension: 80,
+      friction: 8,
+      useNativeDriver: false
+    }).start();
+  };
+  
+  const expandSheet = () => {
+    if (!isExpanded.current) {
+      isExpanded.current = true;
+      Animated.spring(sheetHeight, {
+        toValue: 400,
+        tension: 80,
+        friction: 8,
+        useNativeDriver: false
+      }).start();
+    }
+  };
+  
+  const collapseSheet = () => {
+    if (isExpanded.current) {
+      isExpanded.current = false;
+      Animated.spring(sheetHeight, {
+        toValue: 200,
+        tension: 80,
+        friction: 8,
+        useNativeDriver: false
+      }).start();
+    }
+  };
+
+  // PanResponder for smooth gesture handling - only for the pull handle
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: (_, gestureState) => {
+        // Only handle gestures on the pull handle area
+        return Math.abs(gestureState.dy) > 5;
+      },
+      onPanResponderGrant: () => {
+        // Haptic feedback when starting gesture
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      },
+      onPanResponderMove: (_, gestureState) => {
+        // Smooth height adjustment during gesture
+        const newHeight = isExpanded.current ? 
+          Math.max(200, 400 - gestureState.dy) : 
+          Math.min(400, 200 + Math.abs(gestureState.dy));
+        
+        sheetHeight.setValue(newHeight);
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        // Determine if should expand or collapse based on gesture
+        if (Math.abs(gestureState.dy) > 30) {
+          if (gestureState.dy < 0 && !isExpanded.current) {
+            expandSheet();
+          } else if (gestureState.dy > 0 && isExpanded.current) {
+            collapseSheet();
+          } else {
+            // Snap back to current state
+            Animated.spring(sheetHeight, {
+              toValue: isExpanded.current ? 400 : 200,
+              tension: 80,
+              friction: 8,
+              useNativeDriver: false
+            }).start();
+          }
+        } else {
+          // Snap back to current state if gesture wasn't strong enough
+          Animated.spring(sheetHeight, {
+            toValue: isExpanded.current ? 400 : 200,
+            tension: 80,
+            friction: 8,
+            useNativeDriver: false
+          }).start();
+        }
+      },
+    })
+  ).current;
 
   /* ----- auth/session bootstrap ----- */
   useEffect(()=>{
@@ -571,7 +1476,7 @@ export default function App(){
       setUser(s?.user ?? null);
       if (s?.user) {
         await supabase.rpc('ensure_profile_ready', { p_display_name: displayName || 'Player' });
-        const { data } = await supabase.from('profiles').select('display_name,color').eq('id', s.user.id).single();
+        const { data } = await supabase.from('profiles').select('display_name,color,height_cm,weight_kg,age,activity_level').eq('id', s.user.id).single();
         if (data) {
           setProfile(data);
           // Set default color if none exists
@@ -590,12 +1495,46 @@ export default function App(){
     if(!user) return;
     (async()=>{
       await supabase.rpc('ensure_profile_ready', { p_display_name: displayName || 'Player' });
-      const { data: prof } = await supabase.from('profiles').select('display_name,color').eq('id', user.id).single();
+      const { data: prof } = await supabase.from('profiles').select('display_name,color,height_cm,weight_kg,age,activity_level').eq('id', user.id).single();
       if (prof) setProfile(prof);
       const { data } = await supabase.from('group_members').select('group_id').eq('user_id', user.id).order('joined_at',{ascending:true}).limit(1);
       if (data?.length) setActiveGroupId(data[0].group_id);
+      
+      // Fetch user groups for header display
+      fetchUserGroups();
+      
+      // Fetch daily fitness data
+      fetchDailyFitness();
     })();
-  },[user]);
+  },[user, fetchUserGroups, fetchDailyFitness]);
+
+  // Check if it's a new day and reset fitness data
+  useEffect(() => {
+    if (!user) return;
+    
+    const checkNewDay = async () => {
+      try {
+        const now = new Date();
+        const today = now.toISOString().split('T')[0];
+        const lastCheck = await AsyncStorage.getItem('lastFitnessCheck');
+        
+        if (lastCheck !== today) {
+          await AsyncStorage.setItem('lastFitnessCheck', today);
+          resetDailyFitness();
+        }
+      } catch (error) {
+        console.log('❌ Error checking new day:', error);
+      }
+    };
+    
+    // Check immediately
+    checkNewDay();
+    
+    // Set up interval to check every hour
+    const interval = setInterval(checkNewDay, 60 * 60 * 1000);
+    
+    return () => clearInterval(interval);
+  }, [user, resetDailyFitness]);
 
   /* ----- initial location (fast-start) ----- */
   useEffect(()=>{
@@ -611,9 +1550,9 @@ export default function App(){
             setInitialRegion(lastRegion);
             setTimeout(()=> mapRef.current?.animateToRegion(lastRegion, 600), 150);
             // Small grid first for quick draw
-            generateHexGrid(lastRegion.latitude, lastRegion.longitude, false, true);
+                          generateHexGrid(lastRegion.latitude, lastRegion.longitude, false, conquestMode);
             // Schedule expansion shortly after first paint
-            setTimeout(() => generateHexGrid(lastRegion.latitude, lastRegion.longitude, true), 900);
+              setTimeout(() => generateHexGrid(lastRegion.latitude, lastRegion.longitude, true, conquestMode), 900);
           }
 
           // 2) Fetch fresh position in background with balanced accuracy
@@ -627,7 +1566,7 @@ export default function App(){
         setInitialRegion(region);
           setTimeout(()=> mapRef.current?.animateToRegion(region, 700), 200);
           // Ensure grid exists near fresh position; expand instead of full regen
-          generateHexGrid(region.latitude, region.longitude, true);
+            generateHexGrid(region.latitude, region.longitude, true, conquestMode);
       } else {
           console.log('Location permission denied, using fallback');
           const region = { latitude: 40.7128, longitude: -74.0060, latitudeDelta: 0.02, longitudeDelta: 0.02 }; // NYC fallback
@@ -647,22 +1586,24 @@ export default function App(){
 
 
 
-  /* ----- generate and expand hex grid dynamically ----- */
-  const generateHexGrid = useCallback((lat, lon, expand = false) => {
+      /* ----- generate and expand hex grid dynamically - OPTIMIZED for performance ----- */
+  const generateHexGrid = useCallback((lat, lon, expand = false, isConquestMode = false) => {
     try {
       const center = h3.latLngToCell(lat, lon, H3_RES);
       
-      // Generate hexagons around the center - adjusted for bigger hexagons
-      const radius = H3_RES >= 10 ? 4 : 8; // Bigger radius for bigger hexagons
-      const hexRing = h3.gridDisk(center, radius);
+      // OPTIMIZATION: Cache radius calculations for better performance
+      // In conquest mode, use much larger radius to cover all possible hexagons
+      const radius = isConquestMode ? 20 : (H3_RES >= 10 ? 4 : 8);
+      const maxHexes = isConquestMode ? 1000 : (H3_RES >= 10 ? 80 : 150);
       
-      // Limit total hexagons to prevent crashes
-      const maxHexes = H3_RES >= 10 ? 80 : 150; // More hexagons for bigger area coverage
+      // OPTIMIZATION: Use gridDisk with size limit for better memory management
+      const hexRing = h3.gridDisk(center, radius);
       const limitedHexRing = hexRing.slice(0, maxHexes);
       
       if (expand) {
-        // When expanding, add to existing grid instead of replacing
+        // OPTIMIZATION: Use functional update to avoid unnecessary re-renders
         setAllHexGrid(prevGrid => {
+          // OPTIMIZATION: Use Set for O(1) lookup instead of O(n) array operations
           const newHexes = limitedHexRing.filter(h => !prevGrid.has(h));
           
           if (newHexes.length > 0) {
@@ -671,7 +1612,7 @@ export default function App(){
           return prevGrid;
         });
       } else {
-        // Initial generation
+        // Initial generation - use Set for O(1) operations
         setAllHexGrid(new Set(limitedHexRing));
       }
     } catch (e) {
@@ -679,94 +1620,229 @@ export default function App(){
     }
   }, []);
 
-  /* ----- check if we need to expand hex grid based on current location ----- */
+  /* ----- check if we need to expand hex grid based on current location - OPTIMIZED ----- */
   const checkAndExpandGrid = useCallback((lat, lon) => {
     const now = Date.now();
-    // Only check every 10 seconds to avoid excessive expansion
+    // OPTIMIZATION: Throttle grid expansion checks to reduce CPU usage
     if (now - lastGridExpansionRef.current < 10000) return;
     
     try {
+      // OPTIMIZATION: Cache the current cell calculation
       const currentCell = h3.latLngToCell(lat, lon, H3_RES);
       
-      // Check if current location is in our hex grid
+      // OPTIMIZATION: Use Set.has() for O(1) lookup instead of O(n) search
       if (!allHexGrid.has(currentCell)) {
         lastGridExpansionRef.current = now;
-
-        generateHexGrid(lat, lon, true); // expand = true
+        
+        // OPTIMIZATION: Debounce grid expansion to prevent rapid successive calls
+        if (gridExpansionTimeoutRef.current) {
+          clearTimeout(gridExpansionTimeoutRef.current);
+        }
+        
+                  gridExpansionTimeoutRef.current = setTimeout(() => {
+            generateHexGrid(lat, lon, true, conquestMode); // expand = true, conquest mode
+          }, 100); // Small delay to batch rapid location changes
       }
     } catch (e) {
-      console.log('checkAndExpandGrid error:', e);
+      // Silently handle error for production
     }
   }, [allHexGrid, generateHexGrid]);
 
-  /* ----- owned cells for active group ----- */
-  const fetchCells = async () => {
-    if (!activeGroupId) return;
+  /* ----- SIMPLE hexagon fetching - just get what's in the DB ----- */
+  const fetchCells = useCallback(async () => {
+    if (!activeGroupId || !user?.id) return;
+    
+    console.log('🔄 fetchCells called for group:', activeGroupId.slice(-8));
     
     try {
-
-      
-      const { data: cells, error } = await supabase
+      // SIMPLE: Just get all hexagons in the current group
+      const { data: groupHexagons, error: groupError } = await supabase
         .from('captured_cells')
-        .select('h3_id, user_id')
+        .select('h3_id, user_id, group_id, claimed_at')
         .eq('group_id', activeGroupId);
       
-      if (error) {
-        if (error.message && error.message.includes('502 Bad Gateway')) {
-          console.log('Network error (502 Bad Gateway) - Supabase may be experiencing issues');
-        } else {
-          console.log('Error fetching cells:', error);
-        }
+      if (groupError) {
+        console.log('Error fetching group hexagons:', groupError);
         return;
       }
       
-      if (cells) {
-        const dbCellIds = cells.map(cell => cell.h3_id);
-        setClaimedCells(new Set(dbCellIds));
-
+      if (!groupHexagons || groupHexagons.length === 0) {
+        console.log('No hexagons found in group');
+        setCells([]);
+        setClaimedCells(new Set());
+        return;
       }
       
-      // Fetch user profiles for colors
+      console.log('🎯 Found', groupHexagons.length, 'hexagons in group');
+      
+      // SIMPLE: For each hexagon, find the most recent claim
+      const hexagonOwnership = new Map(); // h3_id -> { user_id, claimed_at }
+      
+      groupHexagons.forEach(hex => {
+        const existing = hexagonOwnership.get(hex.h3_id);
+        if (!existing || new Date(hex.claimed_at) > new Date(existing.claimed_at)) {
+          // This is the most recent claim for this hexagon
+          hexagonOwnership.set(hex.h3_id, {
+            h3_id: hex.h3_id,
+            user_id: hex.user_id,
+            group_id: hex.group_id,
+            claimed_at: hex.claimed_at
+          });
+        }
+      });
+      
+      const uniqueHexagons = Array.from(hexagonOwnership.values());
+      console.log('🎯 Unique hexagons after deduplication:', uniqueHexagons.length);
+      
+      // Set claimed cells for the grid
+      const dbCellIds = uniqueHexagons.map(hex => hex.h3_id);
+      setClaimedCells(new Set(dbCellIds));
+      
+      // SIMPLE: Get user profiles for colors
+      const userIds = [...new Set(uniqueHexagons.map(hex => hex.user_id))];
       const { data: profiles, error: profileError } = await supabase
         .from('profiles')
-        .select('id, color')
-        .in('id', [...new Set(cells?.map(cell => cell.user_id) || [])]);
+        .select('id, color, display_name')
+        .in('id', userIds);
       
       if (profileError) {
-        if (profileError.message && profileError.message.includes('502 Bad Gateway')) {
-          console.log('Network error (502 Bad Gateway) - Supabase may be experiencing issues');
-        } else {
-          console.log('Error fetching profiles:', profileError);
-        }
+        console.log('Error fetching profiles:', profileError);
         return;
       }
       
-      if (profiles) {
-        const profileMap = new Map(profiles.map(p => [p.id, p.color]));
-        const cellsWithColors = cells?.map(cell => ({
-          ...cell,
-          userColor: profileMap.get(cell.user_id) || '#dd3c3c'
-        })) || [];
+      if (profiles && profiles.length > 0) {
+        console.log('🎨 Fetched profiles for colors:', profiles.length, 'users');
         
+        // Create color map
+        const profileMap = new Map(profiles.map(p => [p.id, p.color]));
+        const displayNameMap = new Map(profiles.map(p => [p.id, p.display_name]));
+        
+        // SIMPLE: Create hexagons with colors
+        const cellsWithColors = uniqueHexagons.map(hex => ({
+          ...hex,
+          userColor: profileMap.get(hex.user_id) || '#6aa2ff',
+          displayName: displayNameMap.get(hex.user_id) || `User${hex.user_id.slice(-4)}`
+        }));
+        
+        console.log('🎨 Created', cellsWithColors.length, 'hexagons with colors');
+        
+        // SIMPLE: Check for shared hexagons (multiple users within 10 minutes)
+        const sharedHexagonsMap = new Map();
+        
+        // Group by h3_id to find potential sharing
+        const hexGroups = new Map();
+        groupHexagons.forEach(hex => {
+          if (!hexGroups.has(hex.h3_id)) {
+            hexGroups.set(hex.h3_id, []);
+          }
+          hexGroups.get(hex.h3_id).push(hex);
+        });
+        
+        // Check each hexagon for sharing
+        hexGroups.forEach((claims, hexId) => {
+          if (claims.length > 1) {
+            // Multiple claims - check if different users
+            const uniqueUsers = [...new Set(claims.map(c => c.user_id))];
+            if (uniqueUsers.length > 1) {
+              // Different users - check timing
+              const sortedClaims = claims.sort((a, b) => 
+                new Date(b.claimed_at).getTime() - new Date(a.claimed_at).getTime()
+              );
+              
+              const newest = sortedClaims[0];
+              const secondNewest = sortedClaims[1];
+              
+              if (newest && secondNewest) {
+                const timeDiff = new Date(newest.claimed_at).getTime() - new Date(secondNewest.claimed_at).getTime();
+                const tenMinutes = 10 * 60 * 1000;
+                
+                if (timeDiff <= tenMinutes) {
+                  // Shared within 10 minutes
+                  sharedHexagonsMap.set(hexId, uniqueUsers);
+                  console.log('🔍 Shared hexagon:', hexId.slice(-8), 'between users:', uniqueUsers);
+                } else {
+                  // Conquest - belongs to newest
+                  console.log('🔍 Conquest hexagon:', hexId.slice(-8), 'winner:', newest.user_id.slice(-8));
+                }
+              }
+            }
+          }
+        });
+        
+        // Update shared hexagons state
+        setSharedHexagons(sharedHexagonsMap);
+        
+        // FINALLY: Set the cells with colors
+        console.log('🎯 Setting', cellsWithColors.length, 'hexagons with colors');
         setCells(cellsWithColors);
-
+        
+      } else {
+        console.log('No profiles found for colors');
       }
       
     } catch (e) {
       console.log('Fetch cells error:', e);
     }
-  };
-  useEffect(()=>{ fetchCells(); }, [fetchCells]);
+  }, [activeGroupId, user?.id]);
   
-  // Update claimed cells when cells change - merge with existing claimed cells
+  useEffect(() => { 
+    if (user?.id && activeGroupId) {
+      fetchCells(); 
+    }
+  }, [user?.id, activeGroupId, fetchCells]);
+  
+    // Map refresh is now handled by the groupMembers useEffect to ensure proper sequencing
+  
+
+    
+    // REAL-TIME UPDATES: Subscribe to captured_cells changes for instant updates when someone stops
+    useEffect(() => {
+      if (!activeGroupId || !user?.id) return;
+
+
+      
+              const subscription = supabase
+          .channel('captured_cells_changes')
+          .on(
+            'postgres_changes',
+            {
+              event: '*', // Listen to all events (INSERT, UPDATE, DELETE)
+              schema: 'public',
+              table: 'captured_cells'
+              // No filter - listen to ALL territory changes to catch conflicts and ownership changes
+            },
+            (payload) => {
+              // Only update when someone has finished claiming (not while walking)
+              // This prevents computationally costly updates during active tracking
+              if (payload.event === 'INSERT' || payload.event === 'UPDATE') {
+                // Check if this hexagon is visible in our current view or affects our leaderboard
+                const hexId = payload.new?.h3_id;
+                const isVisibleHex = hexId && allHexGrid.has(hexId);
+                const affectsCurrentGroup = payload.new?.group_id === activeGroupId;
+                const affectsCurrentUser = payload.new?.user_id === user?.id;
+                
+                if (isVisibleHex || affectsCurrentGroup || affectsCurrentUser) {
+                  // Refresh data immediately when relevant changes occur
+                  fetchCells();
+                  fetchMemberHexCounts();
+                }
+              }
+            }
+          )
+          .subscribe();
+
+      // Cleanup subscription on unmount or group change
+      return () => {
+        subscription.unsubscribe();
+      };
+    }, [activeGroupId, user?.id, fetchCells, fetchMemberHexCounts]);
+    
+    // Update claimed cells when cells change - replace with database cells (no merging)
   useEffect(() => {
     if (cells && cells.length > 0) {
-      setClaimedCells(prevClaimed => {
+      // Replace claimed cells with database cells (no merging to avoid duplicates)
         const dbClaimedCells = new Set(cells.map(c => c.h3_id));
-        // Merge database cells with any newly claimed cells that haven't been saved yet
-        const merged = new Set([...prevClaimed, ...dbClaimedCells]);
-        return merged;
-      });
+      setClaimedCells(dbClaimedCells);
       
       // Ensure all claimed hexagons are in the grid
       const claimedHexIds = cells.map(c => c.h3_id);
@@ -782,6 +1858,52 @@ export default function App(){
       }
     }
   }, [cells, allHexGrid]);
+  
+  // Ensure hex counts are fetched whenever group members change
+  useEffect(() => {
+    if (activeGroupId && groupMembers.length > 0) {
+      // Add a delay to ensure state is fully updated and prevent race conditions
+      const timeoutId = setTimeout(() => {
+        if (activeGroupId && groupMembers.length > 0) {
+          fetchMemberHexCounts();
+        }
+      }, 200);
+      
+      // Cleanup timeout if component unmounts or dependencies change
+      return () => clearTimeout(timeoutId);
+    }
+  }, [activeGroupId, groupMembers, fetchMemberHexCounts]);
+  
+  // Periodic refresh as backup to ensure data stays current (every 30 seconds)
+  useEffect(() => {
+    if (!activeGroupId || !user?.id) return;
+    
+    const intervalId = setInterval(() => {
+      console.log('🔄 Periodic refresh - updating map and leaderboard...');
+      fetchCells();
+      fetchMemberHexCounts();
+    }, 30000); // 30 seconds
+    
+    return () => clearInterval(intervalId);
+  }, [activeGroupId, user?.id, fetchCells, fetchMemberHexCounts]);
+  
+  // Refresh data when app comes back to foreground to catch any missed updates
+  useEffect(() => {
+    const handleAppStateChange = (nextAppState) => {
+      if (nextAppState === 'active' && activeGroupId && user?.id) {
+        // Small delay to ensure app is fully active
+        setTimeout(() => {
+          fetchCells();
+          fetchMemberHexCounts();
+        }, 1000);
+      }
+    };
+    
+    // Listen for app state changes
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    
+    return () => subscription?.remove();
+  }, [activeGroupId, user?.id, fetchCells, fetchMemberHexCounts]);
 
   const fetchCellsDebounced = useCallback(() => {
     if (fetchCellsTimer.current) clearTimeout(fetchCellsTimer.current);
@@ -792,8 +1914,6 @@ export default function App(){
   const fetchGroupMembers = useCallback(async () => {
     if (!activeGroupId) { setGroupMembers([]); return; }
     try {
-      console.log('🔍 Fetching group members for group:', activeGroupId);
-      
       // First, fetch all group members
       const { data: members, error: membersError } = await supabase
         .from('group_members')
@@ -802,26 +1922,17 @@ export default function App(){
         .order('joined_at', { ascending: true });
       
       if (membersError) {
-        if (membersError.message && membersError.message.includes('502 Bad Gateway')) {
-          console.log('Network error (502 Bad Gateway) - Supabase may be experiencing issues');
-        } else {
-          console.log('Error fetching group members:', membersError);
-        }
         setGroupMembers([]);
         return;
       }
       
-      console.log('📊 Found group members:', members);
-      
       if (!members || members.length === 0) {
-        console.log('❌ No group members found');
         setGroupMembers([]);
         return;
       }
       
       // Then, fetch profiles for all members
       const userIds = members.map(m => m.user_id);
-      console.log('👥 Fetching profiles for user IDs:', userIds);
       
       const { data: profiles, error: profilesError } = await supabase
         .from('profiles')
@@ -829,11 +1940,8 @@ export default function App(){
         .in('id', userIds);
       
       if (profilesError) {
-        console.log('⚠️ Profile fetch error:', profilesError);
         // Continue with basic member info
       }
-      
-      console.log('🎨 Found profiles:', profiles);
       
       // Create a map of user ID to profile data
       const profileMap = new Map();
@@ -854,36 +1962,627 @@ export default function App(){
         };
       });
       
-      console.log('✅ Formatted members:', formattedMembers);
-      
-      // IMPORTANT: Merge with existing members instead of overwriting
-      setGroupMembers(prevMembers => {
-        const existingIds = new Set(prevMembers.map(m => m.userId));
-        const newMembers = formattedMembers.filter(m => !existingIds.has(m.userId));
-        
-        if (newMembers.length > 0) {
-          console.log('🔄 Merging new members:', newMembers);
-          return [...prevMembers, ...newMembers];
-        } else {
-          console.log('🔄 No new members to merge, keeping existing:', prevMembers.length);
-          return prevMembers;
-        }
-      });
+      // Set members directly (no merging needed for group switching)
+      setGroupMembers(formattedMembers);
+      console.log('✅ Group members set:', formattedMembers.length, 'members');
       
     } catch (e) {
       console.log('❌ fetchGroupMembers error:', e);
-      setGroupMembers([]);
+        setGroupMembers([]);
     }
   }, [activeGroupId]);
 
-  useEffect(() => { fetchGroupMembers(); }, [fetchGroupMembers]);
-  
-  // Also fetch group members when activeGroupId changes
-  useEffect(() => {
-    if (activeGroupId) {
-      fetchGroupMembers();
+  // Function to fetch user's groups
+  const fetchUserGroups = useCallback(async (isManualRefresh = false) => {
+    if (!user?.id) return;
+    
+    try {
+      console.log('🔍 Fetching user groups...', isManualRefresh ? '(manual refresh)' : '(auto refresh)');
+      
+      const { data, error } = await supabase
+        .from('group_members')
+        .select('group_id, groups(name)')
+        .eq('user_id', user.id)
+        .order('joined_at', { ascending: true });
+        
+      if (error) {
+        console.log('Error fetching user groups:', error);
+        return;
+      }
+      
+      const formattedGroups = (data || []).map(r => ({ 
+        id: r.group_id, 
+        name: r.groups?.name || 'Group' 
+      }));
+      
+      console.log('🔍 Fetched groups:', formattedGroups.length, 'groups');
+      
+      // Only update state if this is a manual refresh or if the groups have actually changed
+      setGroups(prevGroups => {
+        const hasChanged = JSON.stringify(prevGroups) !== JSON.stringify(formattedGroups);
+        if (hasChanged || isManualRefresh) {
+          console.log('✅ Updating groups state:', prevGroups.length, '→', formattedGroups.length);
+          return formattedGroups;
+        } else {
+          console.log('⏭️ Skipping groups state update (no changes)');
+          return prevGroups;
+        }
+      });
+    } catch (error) {
+      console.log('Error fetching user groups:', error);
     }
-  }, [activeGroupId, fetchGroupMembers]);
+  }, [user?.id]);
+
+  /* ----- daily fitness tracking ----- */
+  const fetchDailyFitness = useCallback(async () => {
+    if (!user?.id) return;
+    
+    try {
+      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+      const { data, error } = await supabase
+        .from('daily_fitness')
+        .select('steps, calories_burned')
+        .eq('user_id', user.id)
+        .eq('date', today)
+        .single();
+      
+      if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
+        console.log('❌ Error fetching daily fitness:', error);
+        return;
+      }
+      
+      if (data) {
+        setDailySteps(data.steps || 0);
+        setDailyCalories(data.calories_burned || 0);
+      } else {
+        // Create new entry for today if none exists
+        const { error: insertError } = await supabase
+          .from('daily_fitness')
+          .insert({
+            user_id: user.id,
+            date: today,
+            steps: 0,
+            calories_burned: 0
+          });
+        
+        if (insertError) {
+          console.log('❌ Error creating daily fitness entry:', insertError);
+        } else {
+          setDailySteps(0);
+          setDailyCalories(0);
+        }
+      }
+    } catch (error) {
+      console.log('❌ Error in fetchDailyFitness:', error);
+    }
+  }, [user?.id]);
+
+  const updateDailyFitness = useCallback(async (newSteps, newCalories) => {
+    if (!user?.id) return;
+    
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const { error } = await supabase
+        .from('daily_fitness')
+        .upsert({
+          user_id: user.id,
+          date: today,
+          steps: newSteps,
+          calories_burned: newCalories
+        }, { onConflict: 'user_id,date' });
+      
+      if (error) {
+        console.log('❌ Error updating daily fitness:', error);
+        return;
+      }
+      
+      setDailySteps(newSteps);
+      setDailyCalories(newCalories);
+    } catch (error) {
+      console.log('❌ Error in updateDailyFitness:', error);
+    }
+  }, [user?.id]);
+
+  // Reset daily fitness data at midnight
+  const resetDailyFitness = useCallback(async () => {
+    if (!user?.id) return;
+    
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const { error } = await supabase
+        .from('daily_fitness')
+        .upsert({
+          user_id: user.id,
+          date: today,
+          steps: 0,
+          calories_burned: 0
+        }, { onConflict: 'user_id,date' });
+      
+      if (error) {
+        // Silently handle error for production
+        return;
+      }
+      
+      setDailySteps(0);
+      setDailyCalories(0);
+    } catch (error) {
+      // Silently handle error for production
+    }
+  }, [user?.id]);
+
+  // Simulate step counting and calorie burning based movement
+  const simulateFitnessTracking = useCallback(() => {
+    if (!isTracking) return;
+    
+    try {
+      // Simulate steps based on location changes (roughly 1 step per 0.5 meters)
+      const newSteps = dailySteps + Math.floor(Math.random() * 3) + 1; // 1-3 steps per update
+      
+      // Calculate calories (roughly 0.04 calories per step for walking)
+      const newCalories = Math.round(newSteps * 0.04);
+      
+      updateDailyFitness(newSteps, newCalories);
+    } catch (error) {
+      // Silently handle error for production
+    }
+  }, [isTracking, dailySteps, updateDailyFitness]);
+
+  // Function to leave a group
+  const leaveGroup = useCallback(async (groupId) => {
+    try {
+      // Get current auth user
+      const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
+      if (authError) throw new Error('Authentication error: ' + authError.message);
+      if (!authUser) throw new Error('Not authenticated');
+
+      // Check if user is the owner (owners can delete the entire group)
+      const { data: memberships, error: membershipError } = await supabase
+        .from('group_members')
+        .select('role')
+        .eq('group_id', groupId)
+        .eq('user_id', authUser.id);
+
+      if (membershipError) {
+        throw new Error('Failed to check membership: ' + membershipError.message);
+      }
+      
+      // Check if user is a member and get their role
+      if (!memberships || memberships.length === 0) {
+        throw new Error('You are not a member of this group');
+      }
+      
+      const membership = memberships[0]; // Get the first (and should be only) membership
+      
+      if (membership?.role === 'owner') {
+        // Owner is leaving - delete the entire group
+        try {
+          // Delete in proper order to avoid foreign key constraints
+          // 1. Delete sessions (they reference group_id)
+          const { error: deleteSessionsError } = await supabase
+            .from('sessions')
+            .delete()
+            .eq('group_id', groupId);
+          
+          if (deleteSessionsError) {
+            throw new Error('Failed to delete group sessions: ' + deleteSessionsError.message);
+          }
+          
+          // 2. Delete captured cells (they reference group_id)
+          const { error: deleteCellsError } = await supabase
+            .from('captured_cells')
+            .delete()
+            .eq('group_id', groupId);
+          
+          if (deleteCellsError) {
+            throw new Error('Failed to delete group captured cells: ' + deleteCellsError.message);
+          }
+          
+          // 3. Delete group members (they reference group_id)
+          const { error: deleteMembersError } = await supabase
+            .from('group_members')
+            .delete()
+            .eq('group_id', groupId);
+          
+          if (deleteMembersError) {
+            throw new Error('Failed to delete group members: ' + deleteMembersError.message);
+          }
+          
+          // 4. Add a small delay to ensure deletions are processed
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          // 5. Finally delete the group itself
+          const { error: deleteGroupError } = await supabase
+            .from('groups')
+            .delete()
+            .eq('id', groupId);
+          
+          if (deleteGroupError) {
+            // If group deletion fails, try to just remove the user as a fallback
+            const { error: fallbackError } = await supabase
+              .from('group_members')
+              .delete()
+              .eq('group_id', groupId)
+              .eq('user_id', authUser.id);
+            
+            if (fallbackError) {
+              throw new Error('Failed to delete group and fallback also failed: ' + deleteGroupError.message);
+            }
+            
+            Alert.alert('Group Left', 'Unable to delete the group completely, but you have been removed from it.');
+            return; // Exit early since we handled it differently
+          }
+          
+          Alert.alert('Group Deleted', 'You have deleted the group since you were the owner.');
+          
+        } catch (deletionError) {
+          // Try one more fallback approach
+          try {
+            const { error: finalFallbackError } = await supabase
+              .from('group_members')
+              .delete()
+              .eq('group_id', groupId)
+              .eq('user_id', authUser.id);
+            
+            if (finalFallbackError) {
+              throw new Error('All deletion attempts failed: ' + deletionError.message);
+            }
+            
+            Alert.alert('Group Left', 'Unable to delete the group, but you have been removed from it.');
+            return; // Exit early
+            
+          } catch (finalError) {
+            throw new Error('Failed to delete group: ' + deletionError.message);
+          }
+        }
+      } else {
+        // Regular member - just remove membership
+        const { error: deleteError } = await supabase
+          .from('group_members')
+          .delete()
+          .eq('group_id', groupId)
+          .eq('user_id', authUser.id);
+
+        if (deleteError) {
+          throw new Error('Failed to leave group: ' + deleteError.message);
+        }
+        
+        Alert.alert('Left Group', 'You have successfully left the group.');
+      }
+
+      // Immediately update the groups state to remove the left group
+      setGroups(prevGroups => {
+        const updatedGroups = prevGroups.filter(g => g.id !== groupId);
+        return updatedGroups;
+      });
+      
+      // Force a re-render by updating the groups state again after a brief delay
+      setTimeout(() => {
+        setGroups(currentGroups => {
+          if (currentGroups.some(g => g.id === groupId)) {
+            return currentGroups.filter(g => g.id !== groupId);
+          }
+          return currentGroups;
+        });
+      }, 100);
+      
+      // Also refresh from database to ensure consistency (but with delay to let state update settle)
+      setTimeout(async () => {
+        await fetchUserGroups(true); // Manual refresh to ensure consistency
+      }, 500);
+      
+      // Also refresh group members if we're in a group
+      if (activeGroupId) {
+        await fetchGroupMembers();
+        await fetchMemberHexCounts();
+      }
+      
+      // If we were in the group we just left, switch to first available group
+      if (activeGroupId === groupId) {
+        // Get remaining groups
+        const { data: remainingMemberships } = await supabase
+          .from('group_members')
+          .select('group_id')
+          .eq('user_id', authUser.id)
+          .order('joined_at', { ascending: true });
+
+        if (remainingMemberships && remainingMemberships.length > 0) {
+          setActiveGroupId(remainingMemberships[0].group_id);
+        } else {
+          // No groups left, create a default one
+          Alert.alert('No Groups Left', 'You have left all groups. Creating a new default group for you.');
+          
+          // Create a simple default group
+          const { data: newGroup, error: createError } = await supabase
+            .from('groups')
+            .insert({ 
+              name: 'My Crew', 
+              created_by: authUser.id 
+            })
+            .select('id')
+            .single();
+          
+          if (createError) {
+            // Silently handle error for production
+          } else if (newGroup) {
+            // Add user as owner
+            const { error: memberError } = await supabase.from('group_members').insert({
+              group_id: newGroup.id, 
+              user_id: authUser.id, 
+              role: 'owner'
+            });
+            
+            if (memberError) {
+              // Silently handle error for production
+            } else {
+              setActiveGroupId(newGroup.id);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      Alert.alert('Error', e.message ?? String(e));
+    }
+  }, [activeGroupId]);
+
+  // Function to fetch user profile
+  const fetchProfile = useCallback(async () => {
+    if (!user?.id) return;
+    
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('display_name, color, height_cm, weight_kg, age, activity_level')
+        .eq('id', user.id)
+        .single();
+      
+      if (error) throw error;
+      if (data) setProfile(data);
+      
+    } catch (error) {
+      // Silently handle error for production
+    }
+  }, [user?.id]);
+
+  // Function to fetch hex counts for all group members (SIMPLIFIED - matches fetchCells logic)
+  const fetchMemberHexCounts = useCallback(async () => {
+    if (!activeGroupId) return;
+    
+    try {
+      console.log('🏆 fetchMemberHexCounts called for group:', activeGroupId.slice(-8));
+      
+      // SIMPLE: Just get all hexagons in the current group (same as fetchCells)
+      const { data: groupHexagons, error: groupError } = await supabase
+        .from('captured_cells')
+        .select('h3_id, user_id, group_id, claimed_at')
+        .eq('group_id', activeGroupId);
+      
+      if (groupError) {
+        console.log('Error fetching hexagons for leaderboard:', groupError);
+        return;
+      }
+      
+      if (!groupHexagons || groupHexagons.length === 0) {
+        console.log('No hexagons found for leaderboard');
+        setMemberHexCounts({});
+        setIsLeaderboardLoading(false);
+        return;
+      }
+      
+      console.log('🏆 Found', groupHexagons.length, 'hexagons for leaderboard');
+      
+      // SIMPLE: For each hexagon, find the most recent claim (same logic as fetchCells)
+      const hexagonOwnership = new Map(); // h3_id -> { user_id, claimed_at }
+      
+      groupHexagons.forEach(hex => {
+        const existing = hexagonOwnership.get(hex.h3_id);
+        if (!existing || new Date(hex.claimed_at) > new Date(existing.claimed_at)) {
+          // This is the most recent claim for this hexagon
+          hexagonOwnership.set(hex.h3_id, {
+            h3_id: hex.h3_id,
+            user_id: hex.user_id,
+            group_id: hex.group_id,
+            claimed_at: hex.claimed_at
+          });
+        }
+      });
+      
+      const uniqueHexagons = Array.from(hexagonOwnership.values());
+      console.log('🏆 Unique hexagons for leaderboard:', uniqueHexagons.length);
+      
+      // CRITICAL: Count hexagons per user, including shared hexagons
+      const counts = {};
+      
+      // First, count all unique hexagons (non-shared)
+      uniqueHexagons.forEach(hex => {
+        counts[hex.user_id] = (counts[hex.user_id] || 0) + 1;
+      });
+      
+      // SIMPLE: Check for shared hexagons (multiple users within 10 minutes)
+      const sharedHexagons = new Map();
+      
+      // Group by h3_id to find potential sharing
+      const hexGroups = new Map();
+      groupHexagons.forEach(hex => {
+        if (!hexGroups.has(hex.h3_id)) {
+          hexGroups.set(hex.h3_id, []);
+        }
+        hexGroups.get(hex.h3_id).push(hex);
+      });
+      
+      // Check each hexagon for sharing
+      hexGroups.forEach((claims, hexId) => {
+        if (claims.length > 1) {
+          // Multiple claims - check if different users
+          const uniqueUsers = [...new Set(claims.map(c => c.user_id))];
+          if (uniqueUsers.length > 1) {
+            // Different users - check timing
+            const sortedClaims = claims.sort((a, b) => 
+              new Date(b.claimed_at).getTime() - new Date(a.claimed_at).getTime()
+            );
+            
+            const newest = sortedClaims[0];
+            const secondNewest = sortedClaims[1];
+            
+            if (newest && secondNewest) {
+              const timeDiff = new Date(newest.claimed_at).getTime() - new Date(secondNewest.claimed_at).getTime();
+              const tenMinutes = 10 * 60 * 1000;
+              
+              if (timeDiff <= tenMinutes) {
+                // Shared within 10 minutes - each user gets 1 point
+                sharedHexagons.set(hexId, uniqueUsers);
+                console.log('🏆 Shared hexagon in leaderboard:', hexId.slice(-8), 'between users:', uniqueUsers);
+                
+                // IMPORTANT: For shared hexagons, each user gets 1 point
+                uniqueUsers.forEach(userId => {
+                  counts[userId] = (counts[userId] || 0) + 1;
+                });
+                
+                // Remove the single count we added earlier for this hexagon
+                // (since we're now giving each user 1 point for sharing)
+                const ownerFromUnique = uniqueHexagons.find(h => h.h3_id === hexId);
+                if (ownerFromUnique) {
+                  counts[ownerFromUnique.user_id] = Math.max(0, (counts[ownerFromUnique.user_id] || 0) - 1);
+                }
+              } else {
+                // Conquest - belongs to newest
+                console.log('🏆 Conquest hexagon in leaderboard:', hexId.slice(-8), 'winner:', newest.user_id.slice(-8));
+              }
+            }
+          }
+        }
+      });
+      
+      console.log('🏆 Final leaderboard counts:', counts);
+      console.log('🏆 Shared hexagons in leaderboard:', sharedHexagons.size);
+      
+      // Debug: Show detailed counting breakdown
+      if (sharedHexagons.size > 0) {
+        console.log('🏆 Shared hexagon breakdown:');
+        sharedHexagons.forEach((users, hexId) => {
+          console.log(`  Hexagon ${hexId.slice(-8)}: ${users.length} users sharing`);
+          users.forEach(userId => {
+            console.log(`    User ${userId.slice(-8)}: ${counts[userId]} total hexagons`);
+          });
+        });
+      }
+      
+      // Update the leaderboard
+      setMemberHexCounts(counts);
+      
+      // Clear loading state
+      setIsLeaderboardLoading(false);
+      console.log('✅ Leaderboard updated successfully');
+      
+      // Final verification: Show what each user should have
+      console.log('🏆 Final verification - User hexagon counts:');
+      Object.entries(counts).forEach(([userId, count]) => {
+        console.log(`  User ${userId.slice(-8)}: ${count} hexagons`);
+      });
+      
+    } catch (e) {
+      console.log('❌ fetchMemberHexCounts error:', e);
+      setIsLeaderboardLoading(false);
+    }
+  }, [activeGroupId, setIsLeaderboardLoading]);
+
+  // Function to get detailed information about shared hexagons
+  const getSharedHexagonsInfo = useCallback(() => {
+    if (sharedHexagons.size === 0) return 'No shared hexagons';
+    
+    const sharedInfo = Array.from(sharedHexagons.entries()).map(([hexId, userIds]) => {
+      const hexCell = cells.find(c => c.h3_id === hexId);
+      const ownerColor = hexCell?.userColor || '#6aa2ff';
+      return `${hexId.slice(-8)}: ${userIds.length} users (${ownerColor})`;
+    }).slice(0, 5); // Show first 5 shared hexagons
+    
+    return `Shared: ${sharedInfo.join(', ')}${sharedHexagons.size > 5 ? '...' : ''}`;
+  }, [sharedHexagons, cells]);
+
+
+
+  // Function to get all groups the user is part of
+  // Note: Territory is now group-specific, so each group maintains separate hexagon ownership
+  const getUserGroups = useCallback(async () => {
+    if (!user?.id) return [];
+    
+    try {
+      const { data: userGroups, error } = await supabase
+        .from('group_members')
+        .select('group_id')
+        .eq('user_id', user.id);
+      
+      if (error) {
+        return [];
+      }
+      
+      return userGroups?.map(g => g.group_id) || [];
+    } catch (e) {
+      return [];
+    }
+  }, [user?.id]);
+
+  useEffect(() => { fetchProfile(); }, [fetchProfile]);
+  
+  // Consolidated group switching logic to prevent race conditions
+  // Track previous activeGroupId to detect actual changes
+  const prevActiveGroupId = useRef(activeGroupId);
+  
+  useEffect(() => {
+    // Only run this effect when the activeGroupId actually changes (not on every render)
+    if (activeGroupId && activeGroupId !== prevActiveGroupId.current) {
+      // INSTANTLY clear previous group's data and show loading
+      setGroupMembers([]);
+      setMemberHexCounts({});
+      setCells([]);
+      setClaimedCells(new Set());
+      setSharedHexagons(new Map()); // Clear shared hexagons when switching groups
+      setIsLeaderboardLoading(true);
+      
+      // Fetch new group data immediately
+      fetchGroupMembers();
+      
+      // Also regenerate hex grid for the new group location
+      // Use a fallback location if no user location is available
+      const fallbackLat = 37.7749; // Default latitude (San Francisco)
+      const fallbackLon = -122.4194; // Default longitude
+      console.log('🔄 Regenerating hex grid for new group location...');
+      generateHexGrid(fallbackLat, fallbackLon, false, conquestMode);
+      
+      // Debug: Check if hex grid is being generated
+      setTimeout(() => {
+        console.log('🔍 Debug: Hex grid size after regeneration:', allHexGrid?.size || 0);
+      }, 500);
+      
+      // Update the ref to track the change
+      prevActiveGroupId.current = activeGroupId;
+    }
+  }, [activeGroupId, fetchGroupMembers, generateHexGrid, conquestMode]);
+  
+  // Fetch hex counts and map data after group members are loaded (with proper sequencing)
+  useEffect(() => {
+    if (groupMembers.length > 0) {
+      // Small delay to ensure state is fully updated
+      setTimeout(async () => {
+        // DISABLED: Aggressive cleanup was causing hexagons to disappear randomly
+        // console.log('🔄 Group members loaded, running cleanup check...');
+
+        
+        // Simply fetch hex counts and map data without destructive cleanup
+        fetchMemberHexCounts();
+        fetchCells(); // Also fetch map data to show hexagons
+      }, 100);
+      
+      // Safety timeout: clear loading state after 10 seconds if something goes wrong
+      const safetyTimeout = setTimeout(() => {
+        setIsLeaderboardLoading(false);
+      }, 10000);
+      
+      return () => clearTimeout(safetyTimeout);
+    } else if (groupMembers.length === 0) {
+      // If no members, clear loading state
+      setIsLeaderboardLoading(false);
+    }
+  }, [groupMembers, fetchMemberHexCounts, fetchCells]);
 
   /* ----- real-time leaderboard updates ----- */
   useEffect(() => {
@@ -910,6 +2609,9 @@ export default function App(){
         
         // Refresh group members when someone joins/leaves
         fetchGroupMembers();
+        
+        // Also refresh user groups for header updates
+        fetchUserGroups();
       })
       .subscribe();
 
@@ -930,6 +2632,19 @@ export default function App(){
         }
         // Refresh group members to get updated colors/names
         fetchGroupMembers();
+      })
+      .subscribe();
+
+    // Subscribe to groups table changes for real-time group updates
+    const groupsSubscription = supabase
+      .channel(`groups_updates`)
+      .on('postgres_changes', {
+        event: '*', // Listen to all changes (INSERT, UPDATE, DELETE)
+        schema: 'public',
+        table: 'groups'
+      }, (payload) => {
+              // Refresh user groups for header updates (auto-refresh mode)
+      fetchUserGroups(false); // Auto-refresh mode
       })
       .subscribe();
 
@@ -954,12 +2669,13 @@ export default function App(){
 
     // Fallback: Poll for territory updates every 5 minutes
     const fallbackInterval = setInterval(() => {
-      fetchCells();
+        fetchCells();
     }, 300000); // Poll every 5 minutes
 
     return () => {
       membersSubscription.unsubscribe();
       profilesSubscription.unsubscribe();
+      groupsSubscription.unsubscribe();
       territoriesSubscription.unsubscribe();
       clearInterval(fallbackInterval);
     };
@@ -967,16 +2683,53 @@ export default function App(){
 
   /* ----- auth actions ----- */
   const signUp=async()=>{
-    if(!email||!password||!displayName) return Alert.alert('Missing info','Enter email, password, and display name.');
+    if(!email||!password||!displayName) return Alert.alert('Missing info','Enter username, email, and password.');
     
-    const { data, error } = await supabase.auth.signUp({ email, password });
-    if(error) return Alert.alert('Sign up error', error.message);
+    try {
+      // First create the user account with metadata
+      const { data, error } = await supabase.auth.signUp({ 
+        email, 
+        password,
+        options: {
+          data: {
+            display_name: displayName.trim() // Pass username to trigger
+          }
+        }
+      });
+      
+      if(error) throw error;
+      
+      // The database trigger will automatically create the profile with the correct display_name
+      // But we'll also try to create it manually as a backup
+      if (data.user) {
+        const { error: profileError } = await supabase
+          .from('profiles')
+          .insert({
+            id: data.user.id,
+            display_name: displayName.trim(),
+            color: '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0')
+          });
+        
+        if (profileError) {
+          // Continue anyway - profile might be created by trigger
+        }
+      }
     
     Alert.alert('Welcome 👋','Check your email to confirm your account.');
+    } catch (error) {
+      Alert.alert('Sign up error', error.message);
+    }
   };
+  
   const signIn=async()=>{
+    if(!email||!password) return Alert.alert('Missing info','Enter email and password.');
+    
+    try {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
-    if(error) Alert.alert('Sign in error', error.message);
+      if(error) throw error;
+    } catch (error) {
+      Alert.alert('Sign in error', error.message);
+    }
   };
   const signOut=async()=>{ await supabase.auth.signOut(); setActiveGroupId(null); };
 
@@ -1030,10 +2783,9 @@ export default function App(){
 
   const stopWatching = async () => {
     try {
-      console.log('🛑 Stopping location tracking...');
-      
       // Set tracking state first
       setIsTracking(false);
+      setConquestMode(false); // Reset conquest mode when tracking stops
       isTrackingRef.current = false;
       
       // Clear the location interval
@@ -1042,11 +2794,21 @@ export default function App(){
         locationIntervalRef.current = null;
       }
       
-      // Process all collected points and claim hexagons with smart conflict resolution
-      if (points.length > 0 && activeGroupId && user?.id) {
-        console.log(`🏴 Processing ${points.length} collected points...`);
+      // Process all collected points and claim hexagons in ALL groups the user is part of
+      if (points.length > 0 && user?.id) {
+
         
         try {
+          // Get all groups the user is part of
+          const userGroups = await getUserGroups();
+
+          
+          if (userGroups.length === 0) {
+
+            Alert.alert('No Groups', 'You need to be part of at least one group to claim territory!');
+            return;
+          }
+          
           // Convert all points to unique hexagons
           const hexagonsToProcess = new Set();
           points.forEach(point => {
@@ -1054,114 +2816,167 @@ export default function App(){
               const cell = h3.latLngToCell(point.lat, point.lon, H3_RES);
               hexagonsToProcess.add(cell);
             } catch (e) {
-              console.log('Hex conversion error:', e);
+              // Silently handle error for production
             }
           });
           
           const uniqueHexagons = Array.from(hexagonsToProcess);
-          console.log(`🔷 Processing ${uniqueHexagons.length} unique hexagons`);
+
           
           // Get current time for conflict resolution
           const currentTime = Date.now();
           const tenMinutesAgo = currentTime - (10 * 60 * 1000); // 10 minutes in milliseconds
           
-          // Check which hexagons are already claimed and when
-          const { data: existingClaims, error: fetchError } = await supabase
-            .from('captured_cells')
-            .select('h3_id, user_id, claimed_at')
-            .eq('group_id', activeGroupId)
-            .in('h3_id', uniqueHexagons);
+          // Process claims for each group - same hexagons across all groups
+          let totalNewClaims = 0;
+          let totalSharedClaims = 0;
+          let totalAlreadyClaimed = 0;
           
-          if (fetchError) {
-            console.log('❌ Error fetching existing claims:', fetchError);
-            throw fetchError;
-          }
-          
-          // Separate hexagons into new claims and conflicts
-          const newClaims = [];
-          const conflicts = [];
-          const alreadyClaimed = new Set();
-          
-          uniqueHexagons.forEach(hexId => {
-            const existingClaim = existingClaims?.find(claim => claim.h3_id === hexId);
+          for (const groupId of userGroups) {
+
             
-            if (!existingClaim) {
-              // New hexagon - can claim
-              newClaims.push({
-                h3_id: hexId,
-                user_id: user.id,
-                group_id: activeGroupId,
-                claimed_at: new Date(currentTime).toISOString()
-              });
-            } else if (existingClaim.user_id === user.id) {
-              // Already claimed by this user
-              alreadyClaimed.add(hexId);
-            } else {
-              // Check if it's within 10 minutes
-              const claimTime = new Date(existingClaim.claimed_at).getTime();
-              if (claimTime > tenMinutesAgo) {
-                // Within 10 minutes - both users get it
-                conflicts.push({
-                  h3_id: hexId,
-                  user_id: user.id,
-                  group_id: activeGroupId,
-                  claimed_at: new Date(currentTime).toISOString()
-                });
-              } else {
-                // After 10 minutes - new user takes it
+            // Claim hexagons in THIS group only (territory is group-specific)
+            // Each group maintains its own separate territory
+            
+            // Check which hexagons are already claimed in this group
+            const { data: existingClaims, error: fetchError } = await supabase
+              .from('captured_cells')
+              .select('h3_id, user_id, claimed_at')
+              .eq('group_id', groupId)
+              .in('h3_id', uniqueHexagons);
+            
+            if (fetchError) {
+              continue; // Skip this group but continue with others
+            }
+            
+            // Separate hexagons into new claims and conflicts for this group
+            const newClaims = [];
+            const conflicts = [];
+            const alreadyClaimed = new Set();
+            const conquestHexagons = []; // Track hexagons that need conquest cleanup
+            
+            // First pass: categorize hexagons
+            uniqueHexagons.forEach(hexId => {
+              const existingClaim = existingClaims?.find(claim => claim.h3_id === hexId);
+              
+              if (!existingClaim) {
+                // New hexagon - can claim
                 newClaims.push({
                   h3_id: hexId,
                   user_id: user.id,
-                  group_id: activeGroupId,
+                  group_id: groupId,
                   claimed_at: new Date(currentTime).toISOString()
                 });
+              } else if (existingClaim.user_id === user.id) {
+                // Already claimed by this user
+                alreadyClaimed.add(hexId);
+              } else {
+                // Check if it's within 10 minutes
+                const claimTime = new Date(existingClaim.claimed_at).getTime();
+                if (claimTime > tenMinutesAgo) {
+                  // Within 10 minutes - both users get it (shared)
+                  conflicts.push({
+                    h3_id: hexId,
+                    user_id: user.id,
+                    group_id: groupId,
+                    claimed_at: new Date(currentTime).toISOString()
+                  });
+                } else {
+                  // After 10 minutes - new user takes it (conquest)
+                  conquestHexagons.push(hexId);
+                  newClaims.push({
+                    h3_id: hexId,
+                    user_id: user.id,
+                    group_id: groupId,
+                    claimed_at: new Date(currentTime).toISOString()
+                  });
+                }
               }
-            }
-          });
-          
-          // Process all claims at once
-          const allClaims = [...newClaims, ...conflicts];
-          
-          if (allClaims.length > 0) {
-            console.log(`💾 Saving ${allClaims.length} hexagon claims...`);
+            });
             
-            const { error: insertError } = await supabase
-              .from('captured_cells')
-              .upsert(allClaims, {
-                onConflict: 'h3_id,group_id',
-                ignoreDuplicates: false
-              });
-            
-            if (insertError) {
-              console.log('❌ Error saving claims:', insertError);
-              throw insertError;
+            // Note: We don't delete old claims here anymore
+            // The shared hexagon detection logic now handles this automatically
+            // by only marking hexagons as "shared" if they're within 10 minutes
+            if (conquestHexagons.length > 0) {
+              console.log('🏴 Conquest hexagons:', conquestHexagons.length, '- these will not show as shared');
             }
             
-            console.log('✅ All hexagon claims saved successfully');
+            // Process all claims for this group
+            const allClaims = [...newClaims, ...conflicts];
             
-            // Show success message
-            const totalNew = newClaims.length + conflicts.length;
+            if (allClaims.length > 0) {
+              const { error: insertError } = await supabase
+                .from('captured_cells')
+                .upsert(allClaims);
+              
+              if (insertError) {
+                continue; // Skip this group but continue with others
+              }
+              
+              // Update totals
+              totalNewClaims += newClaims.length;
+              totalSharedClaims += conflicts.length;
+              totalAlreadyClaimed += alreadyClaimed.size;
+            }
+          }
+          
+          if (totalNewClaims > 0 || totalSharedClaims > 0) {
+            console.log(`🎉 Total claims across all groups: New: ${totalNewClaims}, Shared: ${totalSharedClaims}, Already yours: ${totalAlreadyClaimed}`);
+            
+            // Show detailed information about shared hexagons
+            let sharedDetails = '';
+            if (totalSharedClaims > 0) {
+              sharedDetails = `\n🏴 ${totalSharedClaims} hexagons are now shared territory!`;
+            }
+            
             Alert.alert(
-              '🏴 Territory Claimed!', 
-              `Successfully claimed ${totalNew} hexagons!\n\n` +
-              `New: ${newClaims.length}\n` +
-              `Shared: ${conflicts.length}\n` +
-              `Already yours: ${alreadyClaimed.size}`,
+              '🏴 Territory Claimed Across All Groups!', 
+              `Successfully claimed territory in ${userGroups.length} groups!\n\n` +
+              `Total New: ${totalNewClaims}\n` +
+              `Total Shared: ${totalSharedClaims}${sharedDetails}\n` +
+              `Already yours: ${totalAlreadyClaimed}`,
               [{ text: 'Awesome!', style: 'default' }]
             );
           } else {
-            console.log('⏭️ No new hexagons to claim');
-            Alert.alert('No New Territory', 'All hexagons on this trail were already claimed!');
+            console.log('⏭️ No new hexagons to claim in any group');
+            console.log('🔍 Debug: This might indicate a database issue or logic problem');
+            Alert.alert('No New Territory', 'All hexagons on this trail were already claimed in all your groups!');
           }
           
-          // Refresh the map to show all new claims
+          // Refresh the map to show all new claims (for current active group)
+          if (activeGroupId) {
+            await fetchCells();
+            await fetchMemberHexCounts();
+          }
+          
+          // Also refresh all groups to show updated territory states
+          
+                // Force refresh with delay to ensure DB is updated
+      setTimeout(async () => {
+        await fetchGroupMembers();
+        if (activeGroupId) {
+          console.log('🔄 Delayed refresh after stop - ensuring colors are displayed...');
           await fetchCells();
+          await fetchMemberHexCounts();
+        }
+      }, 1000);
+      
+      // IMMEDIATE refresh to show colors right away
+      if (activeGroupId) {
+        console.log('🔄 Immediate refresh after stop - showing colors now...');
+        setTimeout(async () => {
+          await fetchCells();
+          await fetchMemberHexCounts(); // Also refresh leaderboard immediately
+        }, 100); // Small delay to ensure DB transaction is complete
+      }
           
         } catch (processingError) {
-          console.log('❌ Error processing hexagons:', processingError);
           Alert.alert('Error', 'Failed to process hexagons: ' + processingError.message);
         }
       }
+      
+      // Clear local claimed hexes (they're now saved to database)
+      setLocalClaimedHexes(new Set());
       
       // Calculate and log session stats
       const endTime = Date.now();
@@ -1169,8 +2984,6 @@ export default function App(){
       const distance = calculateDistance(points);
       const avgSpeed = distance / (duration / 1000); // m/s
       const calories = Math.round(distance * 0.1); // Rough estimate
-      
-      console.log('Session stats:', { duration, distance, avgSpeed, calories });
       
       // Save session to database
       if (activeGroupId && user?.id && points.length > 0) {
@@ -1188,12 +3001,10 @@ export default function App(){
             });
           
           if (error) {
-            console.log('Session save error:', error);
-          } else {
-            console.log('Session saved successfully');
+            // Silently handle error for production
           }
         } catch (sessionError) {
-          console.log('Session save error:', sessionError);
+          // Silently handle error for production
         }
       }
       
@@ -1203,18 +3014,13 @@ export default function App(){
       
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       
-      console.log('✅ Tracking stopped successfully');
-      
     } catch (e) {
-      console.log('Stop watching error:', e);
       Alert.alert('Error', 'Failed to stop tracking: ' + e.message);
     }
   };
 
   const startWatching = async () => {
     try {
-      console.log('🚀 Starting location tracking...');
-      
       setIsTracking(true);
       isTrackingRef.current = true;
       setStartTime(Date.now());
@@ -1227,7 +3033,7 @@ export default function App(){
         return;
       }
       
-      // Set up location interval - collect points every 5 seconds
+      // OPTIMIZATION: Set up location interval - collect points every 5 seconds with local caching
       locationIntervalRef.current = setInterval(async () => {
         if (!isTrackingRef.current) return;
         
@@ -1245,27 +3051,38 @@ export default function App(){
               timestamp: Date.now()
             };
             
+            // OPTIMIZATION: Batch state updates for better performance
             setPoints(prev => [...prev, newPoint]);
             
-            // Update local claimed cells for immediate visual feedback
-            const cell = h3.latLngToCell(newPoint.lat, newPoint.lon, H3_RES);
-            setClaimedCells(prev => {
-              if (!prev.has(cell)) {
-                return new Set([...prev, cell]);
-              }
-              return prev;
-            });
+            // OPTIMIZATION: Process hexagon locally for immediate visual feedback
+            try {
+              const cell = h3.latLngToCell(newPoint.lat, newPoint.lon, H3_RES);
+              
+              // OPTIMIZATION: Use functional update to avoid unnecessary re-renders
+              setLocalClaimedHexes(prev => {
+                if (!prev.has(cell)) {
+                  return new Set([...prev, cell]);
+                }
+                return prev;
+              });
+            } catch (hexError) {
+              // Skip invalid coordinates silently for performance
+            }
+            
+            // Update fitness tracking (steps and calories)
+            simulateFitnessTracking();
+            
+            // Don't update main claimed cells here - let fetchCells handle it
+            // This prevents duplicates between local and database cells
           }
         } catch (error) {
-          console.log('Location error:', error.message);
+          // Silently handle error for production
         }
       }, 5000);
       
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      console.log('✅ Tracking started');
       
     } catch (e) {
-      console.log('Start watching error:', e);
       Alert.alert('Error', 'Failed to start tracking: ' + e.message);
     }
   };
@@ -1275,34 +3092,65 @@ export default function App(){
   const mm=String(Math.floor((secs%3600)/60)).padStart(2,'0');
   const ss=String(secs%60).padStart(2,'0');
 
-  /* ----- live tracking polygons only ----- */
+  /* ----- live tracking polygons only - OPTIMIZED with local caching ----- */
   const livePolygons = useMemo(()=>{
     if (!isTracking || points.length === 0) return [];
-    const set = new Set(); 
-    for (const p of points) set.add(h3.latLngToCell(p.lat, p.lon, H3_RES));
     
-
-    
-    return Array.from(set).map((h3id,i)=>{
-      const coords = polygonFromCell(h3id);
-      if (!coords) return null;
+    // Use Set for O(1) duplicate checking instead of O(n) array operations
+    const uniqueHexIds = new Set(); 
       const base = profile?.color || '#6aa2ff';
-      return { 
-        id:`live-${i}`, 
+    
+    // Process points in a single pass for better performance
+    const result = [];
+    for (const p of points) {
+      try {
+        const hexId = h3.latLngToCell(p.lat, p.lon, H3_RES);
+        if (!uniqueHexIds.has(hexId)) {
+          uniqueHexIds.add(hexId);
+          
+          const coords = polygonFromCell(hexId);
+          if (coords) {
+            result.push({ 
+              id: `live-${hexId}`, 
         coords, 
-        fill: rgba(base, 0.7), // More opaque for live tracking
-        stroke: rgba(base, 1.0), // Solid border
-        strokeWidth: 4, // Thicker border for live tracking
+              fill: rgba(base, 0.7),
+              stroke: rgba(base, 1.0),
+              strokeWidth: 4,
         type: 'live'
-      };
-    }).filter(Boolean);
+            });
+          }
+        }
+      } catch (e) {
+        // Skip invalid coordinates silently for performance
+        continue;
+      }
+    }
+    
+    return result;
   },[isTracking, profile?.color, points]);
 
-  // All hexagons with proper styling based on status
+  // All hexagons with proper styling based on status - OPTIMIZED with local caching
   const allHexPolygons = useMemo(() => {
-    if (!allHexGrid || allHexGrid.size === 0) return [];
+    if (!allHexGrid || allHexGrid.size === 0) {
+      return [];
+    }
     
-
+    // Early return if no changes detected
+    if (allHexGrid.size === 0 && claimedCells.size === 0 && cells.length === 0) {
+      return [];
+    }
+    
+    // Create lookup maps for O(1) access instead of O(n) searches
+    const cellsMap = new Map(cells.map(c => [c.h3_id, c]));
+    const claimedSet = new Set(claimedCells);
+    const localClaimedSet = new Set(localClaimedHexes);
+    
+    // Check if this hexagon is shared between multiple users
+    const isHexShared = (hexId) => {
+      const sharedUsers = sharedHexagons.get(hexId);
+      const isShared = sharedUsers && sharedUsers.length > 1;
+        return isShared;
+      };
     
     const result = Array.from(allHexGrid).map(hexId => {
       if (!hexId) return null;
@@ -1311,54 +3159,103 @@ export default function App(){
       const coords = polygonFromCell(hexId);
       if (!coords) return null;
       
-      const isClaimed = claimedCells.has(hexId);
-      const isOwned = cells.some(c => c.h3_id === hexId);
-      const ownerCell = cells.find(c => c.h3_id === hexId);
-      const isMine = ownerCell?.is_mine || ownerCell?.user_id === user?.id;
+       const isClaimed = claimedSet.has(hexId);
+       const isLocalClaimed = localClaimedSet.has(hexId);
+       
+       // O(1) lookup instead of O(n) search
+       const ownerCell = cellsMap.get(hexId);
+       const isOwned = !!ownerCell;
+       const isMine = ownerCell?.user_id === user?.id;
       
 
       
-      // Priority: Claimed > Owned > Unclaimed
-      if (isClaimed) {
-        // Claimed by current user - make this most prominent
+
+      
+      // Priority: Local Claimed > Claimed > Owned > Unclaimed
+      if (isLocalClaimed) {
+        // Locally claimed while walking - most prominent with pulsing effect
+        const base = profile?.color || '#6aa2ff';
+
+        
+        return {
+          id: hexId,
+          coords: coords,
+            fill: Platform.OS === 'android' ? androidColor(base, 0.8) : rgba(base, 0.8), // Very opaque for local claims
+            stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 1.0), // Solid border
+            strokeWidth: Platform.OS === 'android' ? 5 : 4, // Thicker border for Android
+            type: 'local-claimed',
+            subtype: 'walking'
+          };
+      } else if (isOwned) {
+                // Check if this is a shared hexagon first
+        if (isHexShared(hexId)) {
+          // Shared territory - use unique purple/magenta color that no user can have
+          const sharedUsers = sharedHexagons.get(hexId);
+          const isMySharedTerritory = sharedUsers.includes(user?.id);
+          
+        return {
+          id: hexId,
+          coords: coords,
+            fill: Platform.OS === 'android' 
+              ? 'rgba(128, 0, 128, 0.7)' // Unique purple/magenta for shared territory on Android
+              : 'rgba(128, 0, 128, 0.6)', // Unique purple/magenta for shared territory on iOS
+            stroke: Platform.OS === 'android'
+              ? 'rgba(128, 0, 128, 1.0)' // Solid purple/magenta border on Android
+              : 'rgba(128, 0, 128, 0.9)', // Solid purple/magenta border on iOS
+            strokeWidth: 4, // Thicker border for shared territory
+            type: 'shared',
+            subtype: isMySharedTerritory ? 'mine-shared' : 'other-shared',
+            sharedUsers: sharedUsers,
+            primaryOwner: ownerCell?.user_id,
+            ownerColor: ownerCell?.userColor || '#6aa2ff'
+          };
+        }
+        
+        // Regular owned territory (not shared) - use the ACTUAL owner's color
+        const ownerColor = ownerCell?.userColor;
+        
+        const base = ownerColor || '#6aa2ff'; // Fallback to blue if no color
+        const isMyTerritory = ownerCell?.user_id === user?.id;
+        
+        if (isMyTerritory) {
+          // My territory - solid and prominent
+        return {
+          id: hexId,
+          coords: coords,
+           fill: Platform.OS === 'android' ? androidColor(base, 0.7) : rgba(base, 0.6), // More opaque for my territory on Android
+           stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 1.0), // Solid border
+           strokeWidth: Platform.OS === 'android' ? 4 : 3, // Thicker border for Android
+          type: 'owned',
+          subtype: 'mine',
+           owner: ownerCell?.user_id,
+           ownerColor: base
+         };
+        } else {
+          // Other player's territory - use THEIR color
+        return {
+          id: hexId,
+          coords: coords,
+           fill: Platform.OS === 'android' ? androidColor(base, 0.5) : rgba(base, 0.3), // More visible on Android
+           stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 0.9), // Strong border in their color
+           strokeWidth: Platform.OS === 'android' ? 3.5 : 2.5, // Thicker border for Android
+          type: 'owned',
+          subtype: 'other',
+           owner: ownerCell?.user_id,
+           ownerColor: base
+         };
+        }
+      } else if (isClaimed) {
+        // Fallback for claimed cells that aren't in database yet
         const base = profile?.color || '#6aa2ff';
 
         return {
           id: hexId,
           coords: coords,
-          fill: rgba(base, 0.6), // More opaque for claimed
-          stroke: rgba(base, 1.0), // Solid border for claimed
-          strokeWidth: 3, // Thicker border for claimed
+          fill: Platform.OS === 'android' ? androidColor(base, 0.6) : rgba(base, 0.5), // Medium opacity
+          stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 0.8), // Medium border
+          strokeWidth: Platform.OS === 'android' ? 3 : 2, // Medium border thickness
           type: 'claimed',
-          subtype: 'active'
-        };
-      } else if (isOwned && isMine) {
-        // My territory from database - solid and prominent
-        const base = ownerCell?.color || profile?.color || '#6aa2ff';
-
-        return {
-          id: hexId,
-          coords: coords,
-          fill: rgba(base, 0.4),
-          stroke: rgba(base, 0.9),
-          strokeWidth: 2.5,
-          type: 'owned',
-          subtype: 'mine',
-          owner: ownerCell?.owner_name
-        };
-      } else if (isOwned && !isMine) {
-        // Other player's territory - beautiful transparent overlay
-        const base = ownerCell?.color || '#6aa2ff';
-
-        return {
-          id: hexId,
-          coords: coords,
-          fill: rgba(base, 0.15),
-          stroke: rgba(base, 0.7),
-          strokeWidth: 1.5,
-          type: 'owned',
-          subtype: 'other',
-          owner: ownerCell?.owner_name
+          subtype: 'fallback'
         };
       } else {
         // Unclaimed - neutral but visible
@@ -1366,36 +3263,88 @@ export default function App(){
         return {
           id: hexId,
           coords: coords,
-          fill: theme.isDark ? 'rgba(100, 110, 130, 0.2)' : 'rgba(200, 210, 230, 0.3)', // More visible
-          stroke: theme.isDark ? 'rgba(160, 170, 190, 0.8)' : 'rgba(140, 150, 170, 0.8)', // More visible
+          fill: Platform.OS === 'android' 
+            ? (theme.isDark ? 'rgba(100, 110, 130, 0.3)' : 'rgba(200, 210, 230, 0.4)') // Android rgba
+            : (theme.isDark ? 'rgba(100, 110, 130, 0.2)' : 'rgba(200, 210, 230, 0.3)'), // iOS rgba
+          stroke: Platform.OS === 'android'
+            ? (theme.isDark ? 'rgba(160, 170, 190, 0.9)' : 'rgba(140, 150, 170, 0.9)') // Android rgba
+            : (theme.isDark ? 'rgba(160, 170, 190, 0.8)' : 'rgba(140, 150, 170, 0.8)'), // iOS rgba
           strokeWidth: 1.5, // Slightly thicker for visibility
           type: 'unclaimed'
         };
       }
     }).filter(Boolean);
     
-
-
-    
     return result;
-  }, [allHexGrid, claimedCells, cells, profile?.color, theme.isDark, user?.id]);
-
-
+  }, [allHexGrid, claimedCells, localClaimedHexes, cells, profile?.color, theme.isDark, user?.id, sharedHexagons]);
+    
+    
 
   /* ------------------ SCREENS ------------------ */
+  // Move useState hook outside conditional render to fix hooks error
+  const [isSignUp, setIsSignUp] = useState(false);
+  
   if (!user) {
     return (
       <SafeAreaView style={[styles.screen, { backgroundColor: theme.bg }]}>
-        <BrandHeader subtitle="Own the streets with your crew" onOpenGroups={()=>{}} onOpenLeaderboard={()=>{}} theme={theme} showGroupsButton={false} showLeaderboardButton={false}/>
+        <BrandHeader subtitle="Map Your Trails ⚔️" onOpenGroups={()=>{}} onOpenLeaderboard={()=>{}} onOpenProfile={()=>{}} theme={theme} showGroupsButton={false} showLeaderboardButton={false} showProfileButton={false}/>
         <KeyboardAvoidingView behavior={Platform.OS==='ios'?'padding':undefined} style={{flex:1}}>
           <ScrollView contentContainerStyle={styles.centerWrap}>
             <Card theme={theme} style={{width:'100%'}}>
-              <Text style={[styles.cardTitle, { color: theme.text }]}>Welcome</Text>
-              <Text style={[styles.cardHint, { color: theme.sub }]}>Sign in or create an account to start tracking.</Text>
-              <View style={styles.formRow}><Label theme={theme}>Display name</Label><Input theme={theme} value={displayName} onChangeText={setDisplayName} placeholder="e.g., NovaRunner"/></View>
-              <View style={styles.formRow}><Label theme={theme}>Email</Label><Input theme={theme} value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none" placeholder="you@example.com"/></View>
-              <View style={styles.formRow}><Label theme={theme}>Password</Label><Input theme={theme} value={password} onChangeText={setPassword} secureTextEntry placeholder="••••••••"/></View>
-              <View style={styles.rowGap}><PrimaryButton theme={theme} title="Sign In" onPress={signIn}/><GhostButton theme={theme} title="Sign Up" onPress={signUp}/></View>
+              <Text style={[styles.cardTitle, { color: theme.text }]}>{isSignUp ? 'Create Account' : 'Welcome Back'}</Text>
+              <Text style={[styles.cardHint, { color: theme.sub }]}>
+                {isSignUp ? 'Sign up to start claiming territory with your crew.' : 'Sign in to continue your territory conquest.'}
+              </Text>
+              
+              {/* Username field - only for sign up */}
+              {isSignUp && (
+                <View style={styles.formRow}>
+                  <Label theme={theme}>Username</Label>
+                  <Input 
+                    theme={theme} 
+                    value={displayName} 
+                    onChangeText={setDisplayName} 
+                    placeholder="e.g., NovaRunner"
+                  />
+                </View>
+              )}
+              
+              <View style={styles.formRow}>
+                <Label theme={theme}>Email</Label>
+                <Input 
+                  theme={theme} 
+                  value={email} 
+                  onChangeText={setEmail} 
+                  keyboardType="email-address" 
+                  autoCapitalize="none" 
+                  placeholder="you@example.com"
+                />
+              </View>
+              
+              <View style={styles.formRow}>
+                <Label theme={theme}>Password</Label>
+                <Input 
+                  theme={theme} 
+                  value={password} 
+                  onChangeText={setPassword} 
+                  secureTextEntry 
+                  placeholder="••••••••"
+                />
+              </View>
+              
+              <View style={styles.rowGap}>
+                <PrimaryButton 
+                  theme={theme} 
+                  title={isSignUp ? "Sign Up" : "Sign In"} 
+                  onPress={isSignUp ? signUp : signIn}
+                />
+                <GhostButton 
+                  theme={theme} 
+                  title={isSignUp ? "Already have an account?" : "Create new account"} 
+                  onPress={() => setIsSignUp(!isSignUp)}
+                />
+              </View>
+              
               <View style={{ marginTop: 16, flexDirection:'row', alignItems:'center', justifyContent:'center', gap: 10 }}>
                 <Text style={{ color: theme.sub }}>Dark mode</Text>
                 <Switch value={isDark} onValueChange={setIsDark}/>
@@ -1407,16 +3356,160 @@ export default function App(){
     );
   }
 
+  // Show health setup for new users or existing users updating
+  if (showHealthSetup && user) {
+    // Check if this is an existing user (has health data) or new user
+    const isExistingUser = profile && (profile.height_cm || profile.weight_kg || profile.age);
+    
+    return (
+      <HealthProfileSetup
+        theme={theme}
+        supabase={supabase}
+        user={user}
+        isExistingUser={isExistingUser}
+        onComplete={() => {
+          setShowHealthSetup(false);
+          setHasCompletedHealthSetup(true);
+          setHasShownHealthSetup(true); // Mark as shown for this session
+          // Refresh profile to get new health data
+          fetchProfile();
+        }}
+        onSkip={() => {
+          setShowHealthSetup(false);
+          setHasCompletedHealthSetup(true);
+          setHasShownHealthSetup(true); // Mark as shown for this session
+        }}
+        onBackToProfile={() => {
+          setShowHealthSetup(false);
+          // Reopen profile drawer
+          setProfileOpen(true);
+        }}
+      />
+    );
+  }
+
   return (
     <SafeAreaView style={[styles.screen, { backgroundColor: theme.bg }]}>
+      {/* Hex Info Modal */}
+      {hexInfoModalVisible && selectedHexInfo && (
+        <Animated.View 
+          style={[
+            styles.hexInfoModal,
+            {
+              opacity: modalOpacity,
+              transform: [{ scale: modalScale }]
+            }
+          ]}
+        >
+          <Pressable 
+            style={styles.hexInfoModalBackground}
+            onPress={() => setHexInfoModalVisible(false)}
+          />
+          <View style={[styles.hexInfoContent, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            {/* Header */}
+            <View style={styles.hexInfoHeader}>
+              <Text style={[styles.hexInfoTitle, { color: theme.text }]}>
+                {selectedHexInfo.isShared ? '🏴 Shared Territory' : '📍 Territory Info'}
+              </Text>
+              <Pressable 
+                onPress={() => setHexInfoModalVisible(false)}
+                style={styles.hexInfoCloseButton}
+              >
+                <Text style={styles.hexInfoCloseText}>✕</Text>
+              </Pressable>
+            </View>
+            
+            {/* Hex ID */}
+            <View style={styles.hexInfoSection}>
+              <Text style={[styles.hexInfoLabel, { color: theme.sub }]}>Hex ID</Text>
+              <Text style={[styles.hexInfoValue, { color: theme.text }]}>
+                {selectedHexInfo.hexId.slice(-8)}...
+              </Text>
+            </View>
+            
+            {/* Group */}
+            <View style={styles.hexInfoSection}>
+              <Text style={[styles.hexInfoLabel, { color: theme.sub }]}>Group</Text>
+              <Text style={[styles.hexInfoValue, { color: theme.text }]}>
+                {selectedHexInfo.groupName}
+              </Text>
+            </View>
+            
+            {/* Owners */}
+            <View style={styles.hexInfoSection}>
+              <Text style={[styles.hexInfoLabel, { color: theme.sub }]}>
+                {selectedHexInfo.isShared ? 'Owners' : 'Owner'}
+              </Text>
+              {selectedHexInfo.owners.map((owner, index) => (
+                <View key={index} style={styles.ownerRow}>
+                  <View style={[styles.ownerColor, { backgroundColor: owner.color }]} />
+                  <Text style={[styles.ownerName, { color: theme.text }]}>
+                    {owner.displayName}
+                  </Text>
+                  <Text style={[styles.ownerDate, { color: theme.sub }]}>
+                    {new Date(owner.capturedAt).toLocaleDateString()}
+                  </Text>
+                </View>
+              ))}
+            </View>
+            
+            {/* Close button */}
+            <Pressable 
+              onPress={() => setHexInfoModalVisible(false)}
+              style={({ pressed }) => [
+                styles.hexInfoButton,
+                { 
+                  backgroundColor: theme.primary,
+                  transform: [{ scale: pressed ? 0.95 : 1 }]
+                }
+              ]}
+            >
+              <Text style={styles.hexInfoButtonText}>Close</Text>
+            </Pressable>
+          </View>
+        </Animated.View>
+      )}
+      
+      <View style={[styles.backgroundPattern, { 
+        backgroundColor: theme.isDark ? 'rgba(79, 125, 243, 0.02)' : 'rgba(79, 125, 243, 0.01)'
+      }]} />
       <View style={{ paddingTop: Platform.OS === 'android' ? 25 : 0 }}>
+        {/* OTA Update Notification */}
+        {updateAvailable && (
+          <View style={[styles.updateNotification, { backgroundColor: theme.primary, borderColor: theme.border }]}>
+            <Text style={styles.updateNotificationText}>🔄 Update Available!</Text>
+            <Pressable 
+              onPress={applyUpdate}
+              disabled={isCheckingUpdate}
+              style={[styles.updateButton, { backgroundColor: theme.bg }]}
+            >
+              <Text style={[styles.updateButtonText, { color: theme.primary }]}>
+                {isCheckingUpdate ? 'Updating...' : 'Update Now'}
+              </Text>
+            </Pressable>
+          </View>
+        )}
+        
         <BrandHeader 
-          subtitle={activeGroupId ? `Map · Territories ${profile?.color ? '●' : ''}` : 'Create or join a group'} 
+          subtitle={activeGroupId ? `Group: ${groups.find(g => g.id === activeGroupId)?.name || 'Group'}` : 'Map Your Trails ⚔️'} 
           onOpenGroups={()=>setDrawerOpen(true)} 
-          onOpenLeaderboard={()=>setLeaderboardOpen(true)}
+          onOpenLeaderboard={async () => {
+            setLeaderboardOpen(true);
+            // Always refresh data when opening leaderboard to ensure accuracy
+            if (activeGroupId) {
+              setIsLeaderboardLoading(true);
+              // Refresh both group members and hex counts for complete accuracy
+              await fetchGroupMembers();
+              await fetchMemberHexCounts();
+              setIsLeaderboardLoading(false);
+            }
+          }}
+          onOpenProfile={()=>setProfileOpen(true)}
           theme={theme} 
           showGroupsButton={true}
           showLeaderboardButton={!!activeGroupId}
+          showProfileButton={true}
+          conquestMode={conquestMode}
         />
       </View>
       <View style={{ flex: 1 }}>
@@ -1544,7 +3637,7 @@ export default function App(){
                 }
               }}
           onMapReady={()=>{
-                console.log('Map ready on', Platform.OS);
+                // Map is ready
               }}
             >
               {/* All hexagons - persistent grid */}
@@ -1557,6 +3650,7 @@ export default function App(){
                   strokeColor={p.stroke}
                   fillColor={p.fill}
                   zIndex={p.type === 'claimed' ? 4 : p.type === 'owned' ? (p.subtype === 'mine' ? 3 : 2) : 1}
+                  onPress={() => handleHexTap(p.id)}
                 />
               ) : null
             ))}
@@ -1570,6 +3664,7 @@ export default function App(){
                   strokeColor={p.stroke} 
                   fillColor={p.fill} 
                   zIndex={5}
+                  onPress={() => handleHexTap(p.id)}
                 />
               ) : null
             ))}
@@ -1596,6 +3691,8 @@ export default function App(){
                 }} />
               </Marker>
             )}
+            
+
         </MapView>
           ) : (
             <View style={{ flex: 1, backgroundColor: '#f0f0f0', justifyContent: 'center', alignItems: 'center' }}>
@@ -1604,15 +3701,55 @@ export default function App(){
           )
         )}
         
-        
+        {/* Persistent Floating Buttons - Always visible with beautiful animations */}
+        {initialRegion && (
+          <PersistentFloatingButtons 
+            theme={theme}
+            onOpenGroups={()=>{
+              setDrawerOpen(true);
+            }}
+            onOpenLeaderboard={()=>setLeaderboardOpen(true)}
+            onOpenProfile={()=>setProfileOpen(true)}
+            showGroupsButton={true}
+            showLeaderboardButton={!!activeGroupId}
+            showProfileButton={true}
+            conquestMode={conquestMode}
+            setConquestMode={setConquestMode}
+            isTracking={isTracking}
+            generateHexGrid={generateHexGrid}
+          />
+        )}
 
         <Animated.View style={[styles.bottomSheet, { height: sheetHeight }]}>
           <Card theme={theme} style={{ width:'100%', flex:1, overflow:'hidden' }}>
+            {/* Pull-up handle - integrated into the card */}
+            <View 
+              {...panResponder.panHandlers} 
+              style={styles.pullHandle}
+            >
+              <Animated.View style={[
+                styles.pullHandleBar,
+                {
+                  transform: [{
+                    scale: sheetHeight.interpolate({
+                      inputRange: [200, 400],
+                      outputRange: [1, 1.2]
+                    })
+                  }]
+                }
+              ]} />
+            </View>
+            
             <Pressable onPress={toggleSheet} style={{ alignSelf:'center', paddingVertical: 6 }}>
               <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: theme.sub }}/>
             </Pressable>
 
-            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 12 }} nestedScrollEnabled showsVerticalScrollIndicator={false}>
+            <ScrollView 
+              style={{ flex: 1 }} 
+              contentContainerStyle={{ paddingBottom: 12 }} 
+              nestedScrollEnabled 
+              showsVerticalScrollIndicator={false}
+            >
               <View style={{ flexDirection:'row', justifyContent:'space-between', alignItems:'center', marginTop: 4 }}>
                 <View>
                   <Text style={[styles.cardTitle, { color: theme.text }]}>Live Session</Text>
@@ -1649,16 +3786,94 @@ export default function App(){
                     </View>
                   </View>
                   
+                  {/* Daily Fitness Stats - Replaces Total hexs and My hexs */}
+                  {user && (
                   <View style={styles.statRow}>
-                    <View style={[styles.statCard, { backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', borderColor: theme.border }]}>
-                      <Text style={[styles.statLabel, { color: theme.sub }]}>Total hexs</Text>
-                      <Text style={[styles.statValue, { color: theme.text }]}>{allHexGrid.size}</Text>
+                    <View style={[styles.statCard, { 
+                      backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', 
+                      borderColor: theme.border, 
+                      flex: 1,
+                      alignItems: 'center',
+                      minHeight: 80,
+                      justifyContent: 'center'
+                    }]}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={{ fontSize: 16 }}>👟</Text>
+                        <Text style={[styles.statLabel, { color: theme.sub, fontSize: 14, fontWeight: '600' }]}>Steps</Text>
                     </View>
-                    <View style={[styles.statCard, { backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', borderColor: theme.border }]}>
-                      <Text style={[styles.statLabel, { color: theme.sub }]}>My hexs</Text>
-                      <Text style={[styles.statValue, { color: theme.text }]}>{claimedCells.size}</Text>
+                      <Text style={[styles.statValue, { color: theme.text, fontSize: 20, fontWeight: '800', marginTop: 4 }]}>
+                        {pedometerAvailable && isTracking ? 
+                          (dailySteps + realStepCount).toLocaleString() : 
+                          dailySteps.toLocaleString()
+                        }
+                      </Text>
+                      <Text style={[styles.statLabel, { color: theme.sub, fontSize: 10, marginTop: 2 }]}>
+                        {pedometerAvailable && isTracking ? 'Live' : 'Today'}
+                      </Text>
+                      {pedometerAvailable && (
+                        <Text style={[styles.statLabel, { color: theme.primary, fontSize: 8, marginTop: 2 }]}>
+                          {isTracking ? '📱 Real-time' : '📱 Device sensor'}
+                        </Text>
+                      )}
+                    </View>
+                    
+                    <View style={[styles.statCard, { 
+                      backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', 
+                      borderColor: theme.border, 
+                      flex: 1,
+                      alignItems: 'center',
+                      minHeight: 80,
+                      justifyContent: 'center'
+                    }]}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={{ fontSize: 16 }}>🔥</Text>
+                        <Text style={[styles.statLabel, { color: theme.sub, fontSize: 14, fontWeight: '600' }]}>Calories</Text>
+                  </View>
+                      <Text style={[styles.statValue, { color: theme.text, fontSize: 20, fontWeight: '800', marginTop: 4 }]}>
+                        {pedometerAvailable && isTracking ? 
+                          (dailyCalories + realCalories).toLocaleString() : 
+                          dailyCalories.toLocaleString()
+                        }
+                      </Text>
+                      <Text style={[styles.statLabel, { color: theme.sub, fontSize: 10, marginTop: 2 }]}>
+                        {pedometerAvailable && isTracking ? 'Live' : 'Today'}
+                      </Text>
+                      {pedometerAvailable && (
+                        <Text style={[styles.statLabel, { color: theme.primary, fontSize: 8, marginTop: 2 }]}>
+                          {isTracking ? '📱 Real-time' : '📱 Device sensor'}
+                        </Text>
+                      )}
                     </View>
                   </View>
+                  )}
+                  
+
+                  
+                  {/* Shared hexagons indicator */}
+                  {sharedHexagons.size > 0 && (
+                    <View style={styles.statRow}>
+                      <View style={[styles.statCard, { 
+                        backgroundColor: 'rgba(128, 0, 128, 0.8)', 
+                        borderColor: theme.border,
+                        flex: 1,
+                        alignItems: 'center'
+                      }]}>
+                        <Text style={[styles.statLabel, { color: '#ffffff', fontWeight: 'bold' }]}>
+                          🏴 Shared Territories
+                        </Text>
+                        <Text style={[styles.statValue, { color: '#ffffff' }]}>
+                          {sharedHexagons.size} hexagons
+                        </Text>
+                        <Text style={[styles.statLabel, { color: '#ffffff', fontSize: 10 }]}>
+                          (Purple color on map)
+                        </Text>
+                      </View>
+                    </View>
+                  )}
+                  
+
+                  
+
 
                   {/* Visual status indicator */}
                   {isTracking && (
@@ -1684,954 +3899,58 @@ export default function App(){
                         <View style={{ alignItems: 'center' }}>
                           <Text style={[styles.statLabel, { color: 'white', fontSize: 12, marginTop: 4 }]}>
                             Location Interval: {locationIntervalRef.current ? '✅ Active' : '❌ Inactive'}
-                          </Text>
+                      </Text>
                           <Text style={[styles.statLabel, { color: 'white', fontSize: 12 }]}>
                             Last Cell: {lastCellRef.current ? lastCellRef.current.slice(-6) : 'None'}
-                          </Text>
+                            </Text>
                           <Text style={[styles.statLabel, { color: 'white', fontSize: 12 }]}>
                             Location Updates: {locationCounterRef.current}
-                          </Text>
+                            </Text>
                           <Text style={[styles.statLabel, { color: 'white', fontSize: 12 }]}>
                             Points Collected: {points.length}
                           </Text>
-                          <Text style={[styles.statLabel, { color: 'white', fontSize: 12 }]}>
-                            Local Claims: {claimedCells.size}
+                                                    <Text style={[styles.statLabel, { color: 'white', fontSize: 12 }]}>
+                            Total Claims: {claimedCells.size}
                           </Text>
                         </View>
                       </View>
                     </View>
                   )}
 
-                  {/* Claimed hexagons preview */}
-                  {claimedCells.size > 0 && (
-                    <View style={{ marginTop: 10 }}>
-                      <Text style={[styles.statLabel, { color: theme.sub, marginBottom: 8 }]}>
-                        🏴 Your Claimed Territory ({claimedCells.size} hexagons)
-                      </Text>
-                      <View style={{
-                        flexDirection: 'row',
-                        flexWrap: 'wrap',
-                        gap: 8,
-                        paddingHorizontal: 4
-                      }}>
-                        {Array.from(claimedCells).slice(0, 6).map((hexId, index) => (
-                          <View key={index} style={{
-                            backgroundColor: profile?.color || '#6aa2ff',
-                            paddingHorizontal: 8,
-                            paddingVertical: 4,
-                            borderRadius: 12,
-                            borderWidth: 1,
-                            borderColor: 'white'
-                          }}>
-                            <Text style={{ color: 'white', fontSize: 10, fontWeight: 'bold' }}>
-                              {hexId.slice(-4)}
-                            </Text>
-                          </View>
-                        ))}
-                        {claimedCells.size > 6 && (
-                          <View style={{
-                            backgroundColor: theme.sub,
-                            paddingHorizontal: 8,
-                            paddingVertical: 4,
-                            borderRadius: 12,
-                            borderWidth: 1,
-                            borderColor: theme.border
-                          }}>
-                            <Text style={{ color: theme.text, fontSize: 10 }}>
-                              +{claimedCells.size - 6} more
-                            </Text>
-                          </View>
-                        )}
-                      </View>
-                    </View>
-                  )}
 
-                  {profile?.color && (
-                    <View style={styles.statRow}>
-                      <View style={[styles.statCard, { backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', borderColor: theme.border, flex: 1 }]}>
-                        <Text style={[styles.statLabel, { color: theme.sub }]}>My Territory Color</Text>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
-                          <View style={{
-                            width: 24,
-                            height: 24,
-                            backgroundColor: profile.color,
-                            borderRadius: 12,
-                            marginRight: 8,
-                            borderWidth: 2,
-                            borderColor: theme.border
-                          }} />
-                          <Text style={[styles.statValue, { color: theme.text, fontSize: 14 }]}>
-                            {profile.display_name || 'You'}
-                          </Text>
-                        </View>
-                      </View>
-                    </View>
-                  )}
 
-                  <View style={{ flexDirection:'row', gap:10, justifyContent:'space-between', marginTop: 8 }}>
-                    <GhostButton theme={theme} title="Refresh Map" onPress={fetchCells} mild />
-                    <GhostButton theme={theme} title="Check for Updates" onPress={() => {
-                      console.log('Manual territory check triggered');
+
+
+
+
+
+
+
+
+
+
+                  <View style={{ flexDirection:'row', gap:12, justifyContent:'space-between', marginTop: 16, paddingHorizontal: 4 }}>
+                    <CoolButton 
+                      theme={theme} 
+                      title="Refresh Map" 
+                      type="refresh"
+                      onPress={() => {
                       fetchCells();
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Claiming Logic" onPress={async () => {
-                      if (!activeGroupId || !user?.id) {
-                        Alert.alert('No Group', 'Join a group first to test claiming logic');
-                        return;
-                      }
-                      
-                      console.log('🧪 Testing claiming logic...');
-                      
-                      try {
-                        // Get current claimed cells
-                        const { data: currentClaims, error } = await supabase
-                          .from('captured_cells')
-                          .select('h3_id, user_id, claimed_at')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (error) {
-                          console.log('❌ Error fetching current claims:', error);
-                          return;
+                        // Also refresh leaderboard to show updated hexagon counts
+                        if (activeGroupId) {
+                          fetchMemberHexCounts();
                         }
-                        
-                        console.log(`📊 Current claims in database: ${currentClaims?.length || 0}`);
-                        console.log('🔍 Sample claims:', currentClaims?.slice(0, 3));
-                        
-                        // Test a sample hexagon
-                        const testHex = '8d2aa5d6334c43f'; // Use one of your existing hexagons
-                        
-                        const existingClaim = currentClaims?.find(claim => claim.h3_id === testHex);
-                        
-                        if (existingClaim) {
-                          if (existingClaim.user_id === user.id) {
-                            console.log(`✅ Hex ${testHex.slice(-6)} already claimed by you`);
-                            Alert.alert('Test Result', `Hex ${testHex.slice(-6)} already claimed by you`);
-                          } else {
-                            console.log(`⚠️ Hex ${testHex.slice(-6)} claimed by another user`);
-                            Alert.alert('Test Result', `Hex ${testHex.slice(-6)} claimed by another user`);
-                          }
-                        } else {
-                          console.log(`🆕 Hex ${testHex.slice(-6)} not claimed yet`);
-                          Alert.alert('Test Result', `Hex ${testHex.slice(-6)} not claimed yet`);
-                        }
-                        
-                      } catch (e) {
-                        console.log('Test error:', e);
-                        Alert.alert('Error', 'Test failed: ' + e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Capture" onPress={async () => {
-                      if (activeGroupId && user?.id) {
-                        console.log('Testing territory capture...');
-                        const testCell = h3.latLngToCell(40.7128, -74.0060, H3_RES); // NYC test cell
-                        await captureCells([testCell], activeGroupId, user.id);
-                        fetchCells();
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test DB" onPress={async () => {
-                      console.log('Testing database connection...');
-                      const { data, error } = await supabase
-                        .from('captured_cells')
-                        .select('h3_id')
-                        .limit(1);
-                      console.log('DB test result:', { data, error });
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Hex Claim" onPress={async () => {
-                      if (activeGroupId && user?.id) {
-                        console.log('🧪 Testing hex claiming logic...');
-                        const testCell = h3.latLngToCell(40.7128, -74.0060, H3_RES); // NYC test cell
-                        console.log('Test cell:', testCell);
-                        
-                        // Add to claimed cells
-                        setClaimedCells(prev => {
-                          const newSet = new Set([...prev, testCell]);
-                          console.log('Test: Claimed cells updated:', Array.from(newSet));
-                          return newSet;
-                        });
-                        
-                        // Save to database
-                        await captureCells([testCell], activeGroupId, user.id);
-                        console.log('Test: Hex claimed successfully');
-                        fetchCells();
-                      } else {
-                        console.log('Cannot test - missing group or user');
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Location" onPress={async () => {
-                      console.log('🧪 Testing location services...');
-                      try {
-                        const { status } = await Location.requestForegroundPermissionsAsync();
-                        console.log('Location permission status:', status);
-                        
-                        if (status === 'granted') {
-                          const location = await Location.getCurrentPositionAsync({
-                            accuracy: Location.Accuracy.Balanced,
-                            timeout: 5000
-                          });
-                          console.log('Current location:', location.coords);
-                          
-                          const cell = h3.latLngToCell(location.coords.latitude, location.coords.longitude, H3_RES);
-                          console.log('Current H3 cell:', cell);
-                          
-                          Alert.alert('Location Test', 
-                            `Lat: ${location.coords.latitude.toFixed(6)}\n` +
-                            `Lon: ${location.coords.longitude.toFixed(6)}\n` +
-                            `H3 Cell: ${cell}`
-                          );
-                        } else {
-                          Alert.alert('Permission Denied', 'Location permission is required for testing');
-                        }
-                      } catch (e) {
-                        console.log('Location test error:', e);
-                        Alert.alert('Error', 'Location test failed: ' + e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Interval Logic" onPress={async () => {
-                      console.log('🧪 Testing location interval logic manually...');
-                      
-                      if (!isTracking) {
-                        Alert.alert('Not Tracking', 'Start tracking first to test interval logic');
-                        return;
-                      }
-                      
-                      if (!activeGroupId || !user?.id) {
-                        Alert.alert('No Group', 'Join a group first to test interval logic');
-                        return;
-                      }
-                      
-                      try {
-                        // Simulate what the interval does
-                        const location = await Location.getCurrentPositionAsync({
-                          accuracy: Location.Accuracy.Balanced,
-                          timeout: 5000
-                        });
-                        
-                        const { latitude: lat, longitude: lon } = location.coords;
-                        const cell = h3.latLngToCell(lat, lon, H3_RES);
-                        
-                        console.log('📍 Test location:', lat.toFixed(6), lon.toFixed(6));
-                        console.log('🔷 Test H3 cell:', cell);
-                        console.log('🔍 Last cell ref:', lastCellRef.current);
-                        
-                        if (cell !== lastCellRef.current) {
-                          console.log('✅ Test: Would claim new hexagon');
-                          
-                          // Actually claim it for testing
-                          setClaimedCells(prev => {
-                            const newSet = new Set([...prev, cell]);
-                            console.log('Test: Claimed cells updated:', Array.from(newSet));
-                            return newSet;
-                          });
-                          
-                          await captureCells([cell], activeGroupId, user.id);
-                          lastCellRef.current = cell;
-                          
-                          Alert.alert('Test Success', `Would claim hexagon ${cell.slice(-6)}`);
-                        } else {
-                          console.log('⏭️ Test: Same cell, no claim needed');
-                          Alert.alert('Test Result', 'Same cell - no new hexagon to claim');
-                        }
-                        
-                      } catch (e) {
-                        console.log('Test interval logic error:', e);
-                        Alert.alert('Error', 'Test failed: ' + e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Debug Location" onPress={async () => {
-                      console.log('=== DEBUG LOCATION ===');
-                      console.log('isTracking state:', isTracking);
-                      console.log('locationIntervalRef:', !!locationIntervalRef.current);
-                      console.log('locationCounterRef:', locationCounterRef.current);
-                      console.log('lastCellRef:', lastCellRef.current);
-                      console.log('claimedCells:', Array.from(claimedCells));
-                      console.log('activeGroupId:', activeGroupId);
-                      console.log('user:', user?.id);
-                      
-                      try {
-                        const location = await Location.getCurrentPositionAsync({
-                          accuracy: Location.Accuracy.Balanced,
-                          timeout: 5000
-                        });
-                        console.log('Current location:', location.coords);
-                        const cell = h3.latLngToCell(location.coords.latitude, location.coords.longitude, H3_RES);
-                        console.log('Current H3 cell:', cell);
-                      } catch (e) {
-                        console.log('Location error:', e);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Debug State" onPress={() => {
-                      console.log('=== DEBUG STATE ===');
-                      console.log('isTracking state:', isTracking);
-                      console.log('claimedCells state:', Array.from(claimedCells));
-                      console.log('allHexGrid size:', allHexGrid.size);
-                      console.log('cells from DB:', cells.length);
-                      console.log('profile color:', profile?.color);
-                      console.log('activeGroupId:', activeGroupId);
-                      console.log('user ID:', user?.id);
-                    }} mild />
-                    <GhostButton theme={theme} title="Groups" onPress={()=>setDrawerOpen(true)} mild />
-                    <GhostButton theme={theme} title="Claim Current Hex" onPress={async () => {
-                      if (!isTracking) {
-                        Alert.alert('Not Tracking', 'Start tracking first to claim hexagons');
-                        return;
-                      }
-                      
-                      if (!activeGroupId || !user?.id) {
-                        Alert.alert('No Group', 'Join a group first to claim hexagons');
-                        return;
-                      }
-                      
-                      try {
-                        console.log('🧪 Manually claiming current hexagon...');
-                        const location = await Location.getCurrentPositionAsync({
-                          accuracy: Location.Accuracy.Balanced,
-                          timeout: 5000
-                        });
-                        
-                        const { latitude: lat, longitude: lon } = location.coords;
-                        const cell = h3.latLngToCell(lat, lon, H3_RES);
-                        
-                        console.log('📍 Current location:', lat.toFixed(6), lon.toFixed(6));
-                        console.log('🔷 H3 cell:', cell);
-                        
-                        // Check if already claimed
-                        if (claimedCells.has(cell)) {
-                          Alert.alert('Already Claimed', `This hexagon (${cell.slice(-6)}) is already yours!`);
-                          return;
-                        }
-                        
-                        // Add to claimed cells
-                        setClaimedCells(prev => {
-                          const newSet = new Set([...prev, cell]);
-                          console.log('Manual claim: Claimed cells updated:', Array.from(newSet));
-                          return newSet;
-                        });
-                        
-                        // Save to database
-                        await captureCells([cell], activeGroupId, user.id);
-                        console.log('✅ Manual hex claim successful');
-                        
-                        // Refresh map
-                        fetchCells();
-                        
-                        Alert.alert('Hexagon Claimed!', `Successfully claimed hexagon ${cell.slice(-6)}`);
-                        
-                      } catch (e) {
-                        console.log('Manual hex claim error:', e);
-                        Alert.alert('Error', 'Failed to claim hexagon: ' + e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Reset Counter" onPress={() => {
-                      locationCounterRef.current = 0;
-                      console.log('🔄 Location counter reset to 0');
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Interval" onPress={() => {
-                      console.log('🧪 Manually testing location interval...');
-                      console.log('🔍 isTracking state:', isTracking);
-                      console.log('🔍 isTrackingRef.current:', isTrackingRef.current);
-                      if (locationIntervalRef.current) {
-                        console.log('✅ Location interval exists and is running');
-                        console.log('🔍 Interval ref:', !!locationIntervalRef.current);
-                        console.log('🔍 Counter:', locationCounterRef.current);
-                      } else {
-                        console.log('❌ Location interval is not running');
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Refresh Map" onPress={() => {
-                      console.log('🔄 Manually refreshing map...');
-                      console.log('🔍 Current claimed cells state:', Array.from(claimedCells));
-                      console.log('🔍 Current cells from DB:', cells.length);
-                      fetchCells();
-                    }} mild />
-                  </View>
-                  <View style={{ flexDirection:'row', gap:8, justifyContent:'space-between', marginTop: 8 }}>
-                    <GhostButton theme={theme} title="Refresh Grid" onPress={() => {
-                      if (initialRegion) {
-                        generateHexGrid(initialRegion.latitude, initialRegion.longitude);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Debug Map" onPress={() => {
-                      Alert.alert('Map Debug', 
-                        `Platform: ${Platform.OS}\n` +
-                        `Initial Region: ${initialRegion ? 'Set' : 'Not Set'}\n` +
-                        `Total Hexs: ${allHexGrid.size}\n` +
-                        `My Hexs: ${claimedCells.size}\n` +
-                        `Location: ${initialRegion ? `${initialRegion.latitude.toFixed(4)}, ${initialRegion.longitude.toFixed(4)}` : 'Unknown'}`
-                      );
-                    }} mild />
-                    <GhostButton theme={theme} title="Debug Leaderboard" onPress={() => {
-                      Alert.alert('Leaderboard Debug', 
-                        `Active Group: ${activeGroupId || 'None'}\n` +
-                        `Group Members: ${groupMembers.length}\n` +
-                        `Members: ${groupMembers.map(m => `${m.displayName} (${m.role})`).join(', ') || 'None'}`
-                      );
-                    }} mild />
-                    <GhostButton theme={theme} title="Refresh Members" onPress={() => {
-                      if (activeGroupId) {
-                        fetchGroupMembers();
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Debug Group DB" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Check group_members table
-                        const { data: members, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (membersError) throw membersError;
-                        
-                        // Check profiles table
-                        const { data: profiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('id, display_name, group_id')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        Alert.alert('Group Database Debug', 
-                          `Group ID: ${activeGroupId}\n\n` +
-                          `Group Members (${members.length}):\n${members.map(m => `- ${m.user_id} (${m.role})`).join('\n')}\n\n` +
-                          `Profiles (${profiles.length}):\n${profiles.map(p => `- ${p.id}: ${p.display_name}`).join('\n')}`
-                        );
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Add Member" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Create a test user profile
-                        const testUserId = 'test-user-' + Date.now();
-                        const { error: profileError } = await supabase.from('profiles').upsert({
-                          id: testUserId,
-                          display_name: `TestUser${Date.now().toString().slice(-4)}`,
-                          color: '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
-                          group_id: activeGroupId
-                        });
-                        
-                        if (profileError) throw profileError;
-                        
-                        // Add to group members
-                        const { error: memberError } = await supabase.from('group_members').insert({
-                          group_id: activeGroupId,
-                          user_id: testUserId,
-                          role: 'member'
-                        });
-                        
-                        if (memberError) throw memberError;
-                        
-                        Alert.alert('Success', 'Test member added! Now refresh members.');
-                        fetchGroupMembers();
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Network" onPress={async () => {
-                      try {
-                        const { data, error } = await supabase.from('profiles').select('count').limit(1);
-                        if (error) {
-                          if (error.message && error.message.includes('502 Bad Gateway')) {
-                            Alert.alert('Network Issue', '502 Bad Gateway - Supabase may be down. Please try again later.');
-                          } else {
-                            Alert.alert('Network Error', error.message);
-                          }
-                        } else {
-                          Alert.alert('Network OK', 'Connection to Supabase is working!');
-                        }
-                      } catch (e) {
-                        Alert.alert('Network Error', 'Failed to connect to Supabase');
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Fix Group Members" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // First, check current group members
-                        const { data: currentMembers, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (membersError) throw membersError;
-                        
-                        // Check profiles for this group
-                        const { data: groupProfiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('id, display_name, group_id')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        // Find profiles that should be in group but aren't in group_members
-                        const memberUserIds = new Set(currentMembers.map(m => m.user_id));
-                        const missingMembers = groupProfiles.filter(p => !memberUserIds.has(p.id));
-                        
-                        if (missingMembers.length === 0) {
-                          Alert.alert('No Issues', 'All group members are properly linked!');
-                          return;
-                        }
-                        
-                        // Add missing members to group_members
-                        const missingMemberInserts = missingMembers.map(profile => ({
-                          group_id: activeGroupId,
-                          user_id: profile.id,
-                          role: 'member',
-                          joined_at: new Date().toISOString()
-                        }));
-                        
-                        const { error: insertError } = await supabase
-                          .from('group_members')
-                          .insert(missingMemberInserts);
-                        
-                        if (insertError) throw insertError;
-                        
-                        Alert.alert('Fixed!', `Added ${missingMemberInserts.length} missing members to the group.`);
-                        fetchGroupMembers(); // Refresh the list
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Check My Status" onPress={async () => {
-                      if (!activeGroupId || !user) {
-                        Alert.alert('No Info', 'Please select a group and ensure you are logged in');
-                        return;
-                      }
-                      
-                      try {
-                        // Check if current user is in group_members
-                        const { data: myMembership, error: membershipError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId)
-                          .eq('user_id', user.id)
-                          .single();
-                        
-                        if (membershipError && membershipError.code !== 'PGRST116') throw membershipError;
-                        
-                        // Check if current user has profile with correct group_id
-                        const { data: myProfile, error: profileError } = await supabase
-                          .from('profiles')
-                          .select('*')
-                          .eq('id', user.id)
-                          .single();
-                        
-                        if (profileError) throw profileError;
-                        
-                        let statusMessage = `Group: ${activeGroupId}\n`;
-                        statusMessage += `My User ID: ${user.id}\n`;
-                        statusMessage += `My Profile Group: ${myProfile?.group_id || 'None'}\n`;
-                        statusMessage += `In Group Members: ${myMembership ? 'Yes' : 'No'}\n`;
-                        
-                        if (myMembership) {
-                          statusMessage += `My Role: ${myMembership.role}\n`;
-                          statusMessage += `Joined: ${myMembership.joined_at}`;
-                        }
-                        
-                        Alert.alert('My Group Status', statusMessage);
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Deep Debug Group" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Get group info
-                        const { data: groupInfo, error: groupError } = await supabase
-                          .from('groups')
-                          .select('*')
-                          .eq('id', activeGroupId)
-                          .single();
-                        
-                        if (groupError) throw groupError;
-                        
-                        // Get ALL group members
-                        const { data: allMembers, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId)
-                          .order('joined_at', { ascending: true });
-                        
-                        if (membersError) throw membersError;
-                        
-                        // Get ALL profiles for this group
-                        const { data: allProfiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        // Find mismatches
-                        const memberUserIds = new Set(allMembers.map(m => m.user_id));
-                        const profileUserIds = new Set(allProfiles.map(p => p.id));
-                        
-                        const inMembersButNotProfiles = allMembers.filter(m => !profileUserIds.has(m.user_id));
-                        const inProfilesButNotMembers = allProfiles.filter(p => !memberUserIds.has(p.id));
-                        
-                        let debugMessage = `🔍 GROUP DEBUG: "${groupInfo.name}"\n\n`;
-                        debugMessage += `📊 Group Members (${allMembers.length}):\n`;
-                        allMembers.forEach(m => {
-                          debugMessage += `  - ${m.user_id} (${m.role}) - ${m.joined_at}\n`;
-                        });
-                        
-                        debugMessage += `\n👥 Group Profiles (${allProfiles.length}):\n`;
-                        allProfiles.forEach(p => {
-                          debugMessage += `  - ${p.id}: ${p.display_name} (${p.color})\n`;
-                        });
-                        
-                        if (inMembersButNotProfiles.length > 0) {
-                          debugMessage += `\n⚠️ IN MEMBERS BUT NOT PROFILES:\n`;
-                          inMembersButNotProfiles.forEach(m => {
-                            debugMessage += `  - ${m.user_id}\n`;
-                          });
-                        }
-                        
-                        if (inProfilesButNotMembers.length > 0) {
-                          debugMessage += `\n⚠️ IN PROFILES BUT NOT MEMBERS:\n`;
-                          inProfilesButNotMembers.forEach(p => {
-                            debugMessage += `  - ${p.id}: ${p.display_name}\n`;
-                          });
-                        }
-                        
-                        if (inMembersButNotProfiles.length === 0 && inProfilesButNotMembers.length === 0) {
-                          debugMessage += `\n✅ No mismatches found!`;
-                        }
-                        
-                        Alert.alert('Deep Debug Results', debugMessage);
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Force Sync Group" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Get all profiles for this group
-                        const { data: allProfiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        // Get all current group members
-                        const { data: currentMembers, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (membersError) throw membersError;
-                        
-                        const currentMemberIds = new Set(currentMembers.map(m => m.user_id));
-                        
-                        // Find profiles that should be members but aren't
-                        const missingMembers = allProfiles.filter(p => !currentMemberIds.has(p.id));
-                        
-                        if (missingMembers.length === 0) {
-                          Alert.alert('No Action Needed', 'All profiles are already group members!');
-                          return;
-                        }
-                        
-                        // Create missing member records
-                        const newMembers = missingMembers.map((profile, index) => ({
-                          group_id: activeGroupId,
-                          user_id: profile.id,
-                          role: index === 0 ? 'owner' : 'member', // First one is owner
-                          joined_at: new Date().toISOString()
-                        }));
-                        
-                        // Insert missing members
-                        const { error: insertError } = await supabase
-                          .from('group_members')
-                          .insert(newMembers);
-                        
-                        if (insertError) throw insertError;
-                        
-                        Alert.alert('Sync Complete!', `Added ${newMembers.length} missing members to the group.`);
-                        
-                        // Refresh the member list
-                        fetchGroupMembers();
-                        
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Test Display" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Manually test the same logic as fetchGroupMembers
-                        const { data: members, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('user_id, role, joined_at')
-                          .eq('group_id', activeGroupId)
-                          .order('joined_at', { ascending: true });
-                        
-                        if (membersError) throw membersError;
-                        
-                        if (!members || members.length === 0) {
-                          Alert.alert('Test Result', 'No group members found in database');
-                          return;
-                        }
-                        
-                        // Fetch profiles
-                        const userIds = members.map(m => m.user_id);
-                        const { data: profiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('id, display_name, color')
-                          .in('id', userIds);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        // Format members
-                        const profileMap = new Map();
-                        if (profiles) {
-                          profiles.forEach(profile => {
-                            profileMap.set(profile.id, profile);
-                          });
-                        }
-                        
-                        const formattedMembers = members.map(member => {
-                          const profile = profileMap.get(member.user_id);
-                          return {
-                            userId: member.user_id,
-                            role: member.role,
-                            displayName: profile?.display_name || `Player${member.user_id.slice(-4)}`,
-                            color: profile?.color || '#6aa2ff'
-                          };
-                        });
-                        
-                        let testMessage = `🧪 TEST DISPLAY RESULTS\n\n`;
-                        testMessage += `📊 Raw Members (${members.length}):\n`;
-                        members.forEach(m => testMessage += `  - ${m.user_id} (${m.role})\n`);
-                        
-                        testMessage += `\n🎨 Profiles Found (${profiles?.length || 0}):\n`;
-                        if (profiles) {
-                          profiles.forEach(p => testMessage += `  - ${p.id}: ${p.display_name}\n`);
-                        }
-                        
-                        testMessage += `\n✅ Formatted Members (${formattedMembers.length}):\n`;
-                        formattedMembers.forEach(m => testMessage += `  - ${m.displayName} (${m.role})\n`);
-                        
-                        Alert.alert('Test Display Results', testMessage);
-                        
-                        // Also update the state to see if it fixes the display
-                        setGroupMembers(formattedMembers);
-                        
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Force Full Refresh" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Clear current state first
-                        setGroupMembers([]);
-                        
-                        // Wait a moment for state to clear
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                        
-                        // Force a complete refresh
-                        const { data: members, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('user_id, role, joined_at')
-                          .eq('group_id', activeGroupId)
-                          .order('joined_at', { ascending: true });
-                        
-                        if (membersError) throw membersError;
-                        
-                        if (!members || members.length === 0) {
-                          Alert.alert('No Members', 'No group members found');
-                          return;
-                        }
-                        
-                        // Fetch all profiles
-                        const userIds = members.map(m => m.user_id);
-                        const { data: profiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('id, display_name, color')
-                          .in('id', userIds);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        // Format all members at once
-                        const profileMap = new Map();
-                        if (profiles) {
-                          profiles.forEach(profile => {
-                            profileMap.set(profile.id, profile);
-                          });
-                        }
-                        
-                        const allFormattedMembers = members.map(member => {
-                          const profile = profileMap.get(member.user_id);
-                          return {
-                            userId: member.user_id,
-                            role: member.role,
-                            displayName: profile?.display_name || `Player${member.user_id.slice(-4)}`,
-                            color: profile?.color || '#6aa2ff'
-                          };
-                        });
-                        
-                        console.log('🔄 Force refresh - setting all members:', allFormattedMembers);
-                        setGroupMembers(allFormattedMembers);
-                        
-                        Alert.alert('Refresh Complete', `Loaded ${allFormattedMembers.length} members`);
-                        
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Check RLS Issue" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // Try to fetch ALL group members without any user-specific filtering
-                        const { data: allMembers, error: membersError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (membersError) throw membersError;
-                        
-                        // Try to fetch ALL profiles for this group
-                        const { data: allProfiles, error: profilesError } = await supabase
-                          .from('profiles')
-                          .select('*')
-                          .eq('group_id', activeGroupId);
-                        
-                        if (profilesError) throw profilesError;
-                        
-                        // Check if we're getting different results than expected
-                        let debugMessage = `🔍 RLS DEBUG RESULTS\n\n`;
-                        debugMessage += `📊 Group Members Found: ${allMembers.length}\n`;
-                        allMembers.forEach(m => {
-                          debugMessage += `  - ${m.user_id} (${m.role}) - ${m.joined_at}\n`;
-                        });
-                        
-                        debugMessage += `\n👥 Group Profiles Found: ${allProfiles.length}\n`;
-                        allProfiles.forEach(p => {
-                          debugMessage += `  - ${p.id}: ${p.display_name} (${p.color})\n`;
-                        });
-                        
-                        // Check if current user is in the results
-                        const currentUserInMembers = allMembers.some(m => m.user_id === user?.id);
-                        const currentUserInProfiles = allProfiles.some(p => p.id === user?.id);
-                        
-                        debugMessage += `\n🔐 Current User Status:\n`;
-                        debugMessage += `  - User ID: ${user?.id}\n`;
-                        debugMessage += `  - In Members: ${currentUserInMembers ? 'Yes' : 'No'}\n`;
-                        debugMessage += `  - In Profiles: ${currentUserInProfiles ? 'Yes' : 'No'}\n`;
-                        
-                        // Check for RLS policy issues
-                        if (allMembers.length === 1 && allProfiles.length === 1) {
-                          debugMessage += `\n⚠️ RLS ISSUE DETECTED!\n`;
-                          debugMessage += `Only seeing 1 member/profile - likely RLS policy filtering\n`;
-                          debugMessage += `Each user can only see their own data due to security policies`;
-                        }
-                        
-                        Alert.alert('RLS Debug Results', debugMessage);
-                        
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Fix RLS Policy" onPress={async () => {
-                      if (!activeGroupId) {
-                        Alert.alert('No Group', 'Please select a group first');
-                        return;
-                      }
-                      
-                      try {
-                        // This will attempt to fix the RLS policy issue by ensuring
-                        // the current user can see all members of their group
-                        
-                        // First, check if we're a member of this group
-                        const { data: myMembership, error: membershipError } = await supabase
-                          .from('group_members')
-                          .select('*')
-                          .eq('group_id', activeGroupId)
-                          .eq('user_id', user.id)
-                          .single();
-                        
-                        if (membershipError && membershipError.code !== 'PGRST116') throw membershipError;
-                        
-                        if (!myMembership) {
-                          Alert.alert('Not a Member', 'You are not a member of this group');
-                          return;
-                        }
-                        
-                        // Now try to fetch all members using a different approach
-                        // This bypasses potential RLS issues by using the group relationship
-                        const { data: allMembers, error: membersError } = await supabase
-                          .from('group_members')
-                          .select(`
-                            user_id,
-                            role,
-                            joined_at,
-                            profiles!inner(
-                              id,
-                              display_name,
-                              color
-                            )
-                          `)
-                          .eq('group_id', activeGroupId)
-                          .order('joined_at', { ascending: true });
-                        
-                        if (membersError) throw membersError;
-                        
-                        if (!allMembers || allMembers.length === 0) {
-                          Alert.alert('No Members', 'No group members found');
-                          return;
-                        }
-                        
-                        // Format the members
-                        const formattedMembers = allMembers.map(member => ({
-                          userId: member.user_id,
-                          role: member.role,
-                          displayName: member.profiles?.display_name || `Player${member.user_id.slice(-4)}`,
-                          color: member.profiles?.color || '#6aa2ff'
-                        }));
-                        
-                        console.log('🔧 RLS Fix - setting all members:', formattedMembers);
-                        setGroupMembers(formattedMembers);
-                        
-                        Alert.alert('RLS Fix Applied', `Loaded ${formattedMembers.length} members using group relationship`);
-                        
-                      } catch (e) {
-                        Alert.alert('Error', e.message);
-                      }
-                    }} mild />
-                    <GhostButton theme={theme} title="Sign out" onPress={signOut} danger />
+                        // Refresh fitness data
+                        fetchDailyFitness();
+                      }} 
+                    />
+
+                    <CoolButton 
+                      theme={theme} 
+                      title="Sign Out" 
+                      type="signout"
+                      onPress={signOut} 
+                    />
                   </View>
                 </>
               )}
@@ -2642,17 +3961,20 @@ export default function App(){
 
       <GroupsDrawer
         visible={drawerOpen}
-        onClose={()=>setDrawerOpen(false)}
+        onClose={()=>{
+          setDrawerOpen(false);
+        }}
         activeGroupId={activeGroupId}
         onSelectGroup={(gid)=>{ 
-          setActiveGroupId(gid); 
+          
+          // Simply close drawer and change group - useEffect will handle the rest
           setDrawerOpen(false);
-          // Fetch group members immediately when group is selected
-          setTimeout(() => fetchGroupMembers(), 100);
+          setActiveGroupId(gid);
         }}
         refreshCells={fetchCells}
         theme={theme}
         userId={user?.id}
+        leaveGroup={leaveGroup}
       />
 
       <LeaderboardDrawer
@@ -2661,58 +3983,735 @@ export default function App(){
         theme={theme}
         groupMembers={groupMembers}
         activeGroupId={activeGroupId}
+        memberHexCounts={memberHexCounts}
+        isLoading={isLeaderboardLoading}
+      />
+
+      <ProfileDrawer
+        visible={profileOpen}
+        onClose={()=>setProfileOpen(false)}
+        theme={theme}
+        user={user}
+        profile={profile}
+        onProfileUpdate={(data) => {
+          // Check if this is a signal to open health setup
+          if (data && data.openHealthSetup) {
+            setShowHealthSetup(true);
+            setProfileOpen(false); // Close the profile drawer
+            return;
+          }
+          
+          // Normal profile update
+          fetchProfile();
+          // Also refresh leaderboard to show updated profile immediately
+          if (activeGroupId) {
+            fetchGroupMembers();
+            fetchMemberHexCounts();
+          }
+        }}
+
       />
     </SafeAreaView>
   );
 }
 
+/* ------------------ PERSISTENT FLOATING BUTTONS ------------------ */
+function PersistentFloatingButtons({ theme, onOpenGroups, onOpenLeaderboard, onOpenProfile, showGroupsButton, showLeaderboardButton, showProfileButton, conquestMode, setConquestMode, isTracking, generateHexGrid }) {
+  const slideAnim = useRef(new Animated.Value(0)).current;
+  const groupsAnim = useRef(new Animated.Value(0)).current;
+  const leaderboardAnim = useRef(new Animated.Value(0)).current;
+  const profileAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    // Slide in from top on mount with staggered animation
+    Animated.stagger(100, [
+      Animated.spring(slideAnim, {
+        toValue: 1,
+        useNativeDriver: true,
+        tension: 100,
+        friction: 8,
+      }),
+      Animated.spring(groupsAnim, {
+        toValue: 1,
+        useNativeDriver: true,
+        tension: 100,
+        friction: 8,
+      }),
+      Animated.spring(leaderboardAnim, {
+        toValue: 1,
+        useNativeDriver: true,
+        tension: 100,
+        friction: 8,
+      }),
+      Animated.spring(profileAnim, {
+        toValue: 1,
+        useNativeDriver: true,
+        tension: 100,
+        friction: 8,
+      })
+    ]).start();
+  }, []);
+
+  const handlePress = (action, animRef) => {
+    // Beautiful press animation
+    Animated.sequence([
+      Animated.timing(animRef, {
+        toValue: 0.8,
+        duration: 100,
+        useNativeDriver: true,
+      }),
+      Animated.timing(animRef, {
+        toValue: 1,
+        duration: 200,
+        useNativeDriver: true,
+        easing: Easing.elastic(1.2),
+      })
+    ]).start(() => {
+      action();
+    });
+  };
+
+  return (
+    <>
+            {/* Groups button - Left Top */}
+      {showGroupsButton && (
+        <>
+          {/* Premium shadow layer */}
+          <Animated.View 
+            style={[
+              styles.premiumShadow,
+              {
+                top: Platform.select({ ios: 40, android: 60 }),
+                left: 20,
+                transform: [
+                  { 
+                    translateY: groupsAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [-100, 0]
+                    })
+                  },
+                  { scale: groupsAnim }
+                ],
+              }
+            ]}
+          />
+          {/* Inner shadow for 3D effect */}
+          <Animated.View 
+            style={[
+              styles.innerShadow,
+              {
+                top: Platform.select({ ios: 40, android: 60 }),
+                left: 20,
+                transform: [
+                  { 
+                    translateY: groupsAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [-100, 0]
+                    })
+                  },
+                  { scale: groupsAnim }
+                ],
+              }
+            ]}
+          />
+          <Animated.View 
+            style={[
+              styles.persistentButtonLeft,
+              { 
+                backgroundColor: theme.isDark ? 'rgba(15, 15, 15, 0.95)' : 'rgba(250, 250, 250, 0.95)',
+                borderColor: theme.isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.15)',
+                transform: [
+                  { 
+                    translateY: groupsAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [-100, 0]
+                    })
+                  },
+                  { scale: groupsAnim }
+                ],
+              }
+            ]}
+          >
+                          <Pressable 
+                onPress={() => {
+                  if (conquestMode) {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+                    return;
+                  }
+                  handlePress(onOpenGroups, groupsAnim);
+                }}
+                style={[
+                  styles.persistentButtonPressable,
+                  conquestMode && { opacity: 0.5 }
+                ]}
+              >
+                <Text style={[styles.persistentButtonIcon, { color: conquestMode ? '#666666' : (theme.isDark ? '#ffffff' : '#333333') }]}>☰</Text>
+              </Pressable>
+          </Animated.View>
+          
+          {/* Conquest Mode Button - Below Groups Button */}
+          {isTracking && (
+            <Animated.View 
+              style={[
+                styles.conquestModeButton,
+                { 
+                  backgroundColor: conquestMode ? '#ff6b6b' : (theme.isDark ? 'rgba(15, 15, 15, 0.95)' : 'rgba(250, 250, 250, 0.95)'),
+                  borderColor: conquestMode ? '#ff6b6b' : (theme.isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.15)'),
+                  transform: [
+                    { 
+                      translateY: groupsAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [-100, 0]
+                      })
+                    },
+                    { scale: groupsAnim }
+                  ],
+                }
+              ]}
+            >
+              <Pressable 
+                                  onPress={() => {
+                    const newMode = !conquestMode;
+                    setConquestMode(newMode);
+                    
+                    // Regenerate hex grid with conquest mode settings when toggled
+                    if (newMode) {
+                      // In conquest mode, regenerate grid with much larger coverage
+                      const fallbackLat = 37.7749; // Default latitude
+                      const fallbackLon = -122.4194; // Default longitude
+                      generateHexGrid(fallbackLat, fallbackLon, false, true);
+                    } else {
+                      // Back to normal mode, regenerate grid with normal coverage
+                      const fallbackLat = 37.7749; // Default latitude
+                      const fallbackLon = -122.4194; // Default longitude
+                      generateHexGrid(fallbackLat, fallbackLon, false, false);
+                    }
+                    
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                  }}
+                style={styles.persistentButtonPressable}
+              >
+                <Text style={[styles.persistentButtonIcon, { color: conquestMode ? '#ffffff' : (theme.isDark ? '#ffffff' : '#333333') }]}>
+                  {conquestMode ? '🎯' : '⚔️'}
+                </Text>
+              </Pressable>
+            </Animated.View>
+          )}
+        </>
+      )}
+
+      {/* Leaderboard button - Right Top */}
+      {showLeaderboardButton && (
+        <Animated.View 
+                      style={[
+              styles.persistentButtonRightTop,
+              { 
+                backgroundColor: theme.isDark ? 'rgba(20, 20, 20, 0.85)' : 'rgba(255, 255, 255, 0.85)',
+                borderColor: theme.isDark ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)',
+                transform: [
+                  { 
+                    translateY: leaderboardAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [-100, 0]
+                    })
+                  },
+                  { scale: leaderboardAnim }
+                ],
+              }
+            ]}
+        >
+          <Pressable 
+            onPress={() => handlePress(onOpenLeaderboard, leaderboardAnim)}
+            style={styles.persistentButtonPressable}
+          >
+            <Text style={[styles.persistentButtonIcon, { color: theme.isDark ? '#ffffff' : '#333333' }]}>🏆</Text>
+          </Pressable>
+        </Animated.View>
+      )}
+
+      {/* Profile button - Right Bottom */}
+      {showProfileButton && (
+        <Animated.View 
+                      style={[
+              styles.persistentButtonRightBottom,
+              { 
+                backgroundColor: theme.isDark ? 'rgba(20, 20, 20, 0.85)' : 'rgba(255, 255, 255, 0.85)',
+                borderColor: theme.isDark ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)',
+                transform: [
+                  { 
+                    translateY: profileAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [-100, 0]
+                    })
+                  },
+                  { scale: profileAnim }
+                ],
+              }
+            ]}
+        >
+          <Pressable 
+            onPress={() => handlePress(onOpenProfile, profileAnim)}
+            style={styles.persistentButtonPressable}
+          >
+            <Text style={[styles.persistentButtonIcon, { color: theme.isDark ? '#ffffff' : '#333333' }]}>👤</Text>
+          </Pressable>
+        </Animated.View>
+      )}
+    </>
+  );
+}
+
+/* ------------------ PROFILE DRAWER ------------------ */
+function ProfileDrawer({ visible, onClose, theme, user, profile, onProfileUpdate }) {
+  const translateX = useRef(new Animated.Value(400)).current;
+  
+  useEffect(() => {
+    Animated.timing(translateX, {
+      toValue: visible ? 0 : 400,
+      duration: 150,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true
+    }).start();
+  }, [visible]);
+
+  return (
+    <Animated.View pointerEvents={visible ? 'auto':'none'} style={[styles.drawerWrapRight, { transform:[{ translateX }] }]}>
+      <View style={[styles.drawer, { backgroundColor: theme.card, borderColor: theme.border, paddingTop: Platform.select({ ios: 44, android: 60 }) }]}>
+        <View style={[styles.drawerHeader, { borderBottomColor: theme.border, zIndex: 3002, elevation: 3002 }]}>
+          <Text style={[styles.drawerTitle, { color: theme.text }]}>👤 Profile Settings</Text>
+          <Pressable 
+            onPress={onClose} 
+            style={[
+              styles.drawerClose, 
+              { 
+                borderColor: '#ff4757'
+              }
+            ]}
+          >
+            <Text style={{color: 'white', fontWeight:'900', fontSize: 18}}>✕</Text>
+          </Pressable>
+        </View>
+
+        <ScrollView contentContainerStyle={{ padding: 16, gap: 16 }}>
+          <ProfileSection 
+            theme={theme} 
+            user={user} 
+            profile={profile} 
+            onProfileUpdate={onProfileUpdate}
+            onOpenHealthSetup={() => onProfileUpdate({ openHealthSetup: true })}
+    
+          />
+        </ScrollView>
+      </View>
+    </Animated.View>
+  );
+}
+
 /* ------------------ STYLES ------------------ */
 const styles = StyleSheet.create({
-  screen:{ flex:1 },
-  header:{ paddingHorizontal:20, paddingTop: Platform.select({ ios: 16, android: 40 }), paddingBottom:14, borderBottomWidth:StyleSheet.hairlineWidth },
-  brand:{ fontSize:20, fontWeight:'800', letterSpacing:.3 },
-  subtitle:{ marginTop:2, fontSize:12 },
-  headerButton:{ paddingVertical:8, paddingHorizontal:12, borderRadius:10, borderWidth:1 },
-  headerButtonText:{ fontWeight:'700' },
+  screen:{ flex:1, position: 'relative' },
+  backgroundPattern: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 0
+  },
+  header:{ paddingHorizontal:20, paddingTop: Platform.select({ ios: 16, android: 40 }), paddingBottom:16, maxWidth: '100%', backgroundColor: 'rgba(255, 255, 255, 0.95)', borderBottomWidth: 1, borderBottomColor: 'rgba(0, 0, 0, 0.08)', shadowColor:'#000', shadowOpacity:0.08, shadowRadius:6, shadowOffset:{width:0,height:2}, elevation: 6, zIndex: 200 },
+  brand:{ fontSize:22, fontWeight:'800', letterSpacing:0.5, color: '#0a0a0a' },
+  subtitle:{ marginTop:3, fontSize:13, color: '#666666', fontWeight: '500', letterSpacing: 0.2 },
+  conquestMode:{ marginTop:6, fontSize:12, fontWeight: 'bold', textAlign: 'center', textShadowColor: 'rgba(0,0,0,0.3)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 2 },
+  headerButton:{ paddingVertical:12, paddingHorizontal:18, borderRadius:16, borderWidth:1.5, backgroundColor: 'rgba(255, 255, 255, 0.9)', shadowColor:'#000', shadowOpacity:0.1, shadowRadius:5, shadowOffset:{width:0,height:2}, elevation: 4 },
+  headerButtonText:{ fontWeight:'800', fontSize: 16, letterSpacing: 0.4 },
 
-  centerWrap:{ padding:20, paddingBottom:32 },
-  card:{ borderRadius:16, padding:16, shadowColor:'#000', shadowOpacity:.2, shadowRadius:12, shadowOffset:{width:0,height:8}, borderWidth:1 },
-  cardTitle:{ fontSize:18, fontWeight:'700' },
-  cardHint:{ fontSize:12, marginTop:4 },
 
-  label:{ marginBottom:6, fontSize:13 },
-  input:{ padding:12, borderRadius:12, borderWidth:1 },
-  formRow:{ marginTop:12 },
-  rowGap:{ marginTop:14, gap:10 },
+  centerWrap:{ padding:24, paddingBottom:40 },
+  card:{ borderRadius:20, padding:20, shadowColor:'#000', shadowOpacity:.06, shadowRadius:12, shadowOffset:{width:0,height:6}, borderWidth:1, elevation: 8, position: 'relative', overflow: 'hidden' },
+  cardGlow: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(79, 125, 243, 0.02)',
+    borderRadius: 20
+  },
+  cardTitle:{ fontSize:20, fontWeight:'800', letterSpacing: 0.5 },
+  cardHint:{ fontSize:13, marginTop:6, lineHeight: 18 },
 
-  buttonPrimary:{ paddingVertical:14, borderRadius:14, alignItems:'center' },
-  buttonPrimaryText:{ color:'white', fontWeight:'700', fontSize:16 },
-  buttonGhost:{ paddingVertical:12, borderRadius:14, alignItems:'center', borderWidth:1 },
-  buttonGhostText:{ fontWeight:'700', fontSize:16 },
+  label:{ marginBottom:8, fontSize:14, fontWeight: '600' },
+  inputContainer: {
+    position: 'relative'
+  },
+  input:{ padding:16, borderRadius:16, borderWidth:1, fontSize: 16, fontWeight: '500' },
+  inputGlow: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 16,
+    zIndex: -1
+  },
+  formRow:{ marginTop:16 },
+  rowGap:{ marginTop:20, gap:12 },
 
-  timer:{ fontSize:28, fontWeight:'800', marginTop:6, letterSpacing:1 },
+  buttonPrimary:{ paddingVertical:16, borderRadius:18, alignItems:'center', shadowColor:'#000', shadowOpacity:0.15, shadowRadius:6, shadowOffset:{width:0,height:3}, elevation: 4, position: 'relative', overflow: 'hidden' },
+  buttonPrimaryText:{ color:'#fff', fontWeight:'700', fontSize:16, letterSpacing: 0.3 },
+  buttonPrimaryGradient: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    borderRadius: 18
+  },
+  buttonPrimaryText:{ color:'white', fontWeight:'800', fontSize:17, letterSpacing: 0.5 },
+  buttonGhost:{ paddingVertical:14, borderRadius:18, alignItems:'center', borderWidth:1, shadowColor:'#000', shadowOpacity:0.12, shadowRadius:6, shadowOffset:{width:0,height:3}, elevation: 4 },
+  buttonGhostText:{ fontWeight:'700', fontSize:16, letterSpacing: 0.3 },
+  
+  coolButton:{ 
+    alignItems: 'center', 
+    justifyContent: 'center', 
+    paddingVertical: 14, 
+    paddingHorizontal: 20, 
+    borderRadius: 16, 
+    shadowColor:'#000', 
+    shadowOpacity:0.15, 
+    shadowRadius:8, 
+    shadowOffset:{width:0,height:4}, 
+    elevation: 6,
+    minHeight: 48,
+    minWidth: 100,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.15)',
+    position: 'relative',
+    overflow: 'hidden'
+  },
+  coolButtonGradient: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 16
+  },
+  coolButtonText:{ 
+    color:'white', 
+    fontWeight:'700', 
+    fontSize:14, 
+    letterSpacing: 0.5,
+    textTransform: 'uppercase'
+  },
+  
+  // OTA Update Notification Styles
+  updateNotification: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginHorizontal: 20,
+    marginTop: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  updateNotificationText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 14,
+  },
+  updateButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+  },
+  updateButtonText: {
+    fontWeight: '600',
+    fontSize: 12,
+  },
 
-  statRow:{ flexDirection:'row', gap:12, marginTop: 8 },
-  statCard:{ flex:1, padding:12, borderRadius:12, borderWidth:1 },
-  statLabel:{ fontSize:12 },
-  statValue:{ fontSize:18, fontWeight:'700', marginTop:2 },
+  timer:{ fontSize:32, fontWeight:'900', marginTop:8, letterSpacing:1.5, textAlign: 'center' },
 
-  bottomSheet:{ position:'absolute', left:0, right:0, bottom:0, paddingHorizontal:12, paddingBottom:16 },
+  statRow:{ flexDirection:'row', gap:16, marginTop: 16 },
+  statCard:{ flex:1, padding:16, borderRadius:18, borderWidth:1, shadowColor:'#000', shadowOpacity:0.12, shadowRadius:10, shadowOffset:{width:0,height:4}, elevation: 6 },
+  statLabel:{ fontSize:13, fontWeight: '600', letterSpacing: 0.3 },
+  statValue:{ fontSize:20, fontWeight:'800', marginTop:4, letterSpacing: 0.5 },
 
-  drawerWrap:{ position:'absolute', top:0, bottom:0, left:0, width:'80%', backgroundColor:'#00000055' },
-  drawerWrapRight:{ position:'absolute', top:0, bottom:0, right:0, width:'80%', backgroundColor:'#00000055' },
-  drawer:{ flex:1, width:'100%', borderRightWidth:1 },
-  drawerHeader:{ paddingHorizontal:16, paddingBottom:12, borderBottomWidth:1, flexDirection:'row', alignItems:'center', justifyContent:'space-between' },
-  drawerTitle:{ fontSize:16, fontWeight:'800' },
-  drawerClose:{ paddingVertical:8, paddingHorizontal:10, borderWidth:1, borderRadius:10 },
+  bottomSheet:{ position:'absolute', left:0, right:0, bottom:0, paddingHorizontal:16, paddingBottom:24, zIndex: 150 },
+  pullHandle: {
+    position: 'absolute',
+    top: -20,
+    left: '50%',
+    transform: [{ translateX: -50 }],
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 160,
+    paddingVertical: 20,
+    paddingHorizontal: 16,
+    width: 150,
+    backgroundColor: 'transparent'
+  },
+  pullHandleBar: {
+    width: 50,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: 'transparent',
+    marginBottom: 8
+  },
+  pullHandleText: {
+    fontSize: 12,
+    color: '#9aa0bb',
+    fontWeight: '500',
+    textAlign: 'center',
+    textShadowColor: 'rgba(0,0,0,0.1)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 1
+  },
+  
+  // Hex Info Modal Styles
+  hexInfoModal: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 5000,
+    elevation: 5000,
+  },
+  hexInfoModalBackground: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  hexInfoContent: {
+    width: '85%',
+    maxWidth: 400,
+    borderRadius: 20,
+    borderWidth: 1,
+    padding: 24,
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 20,
+  },
+  hexInfoHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 20,
+  },
+  hexInfoTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+    flex: 1,
+  },
+  hexInfoCloseButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 71, 87, 0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 71, 87, 0.3)',
+  },
+  hexInfoCloseText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ff4757',
+  },
+  hexInfoSection: {
+    marginBottom: 16,
+  },
+  hexInfoLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 6,
+  },
+  hexInfoValue: {
+    fontSize: 16,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
+  ownerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(79, 125, 243, 0.05)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(79, 125, 243, 0.1)',
+  },
+  ownerColor: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    marginRight: 12,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
+  ownerName: {
+    fontSize: 16,
+    fontWeight: '700',
+    flex: 1,
+    letterSpacing: 0.3,
+  },
+  ownerDate: {
+    fontSize: 12,
+    fontWeight: '500',
+    opacity: 0.8,
+  },
+  hexInfoButton: {
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  hexInfoButtonText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#ffffff',
+    letterSpacing: 0.5,
+  },
 
-  groupRow:{ padding:12, borderRadius:12, borderWidth:1, flexDirection:'row', alignItems:'center', justifyContent:'space-between' },
-  groupName:{ fontWeight:'700' },
 
-  memberRow:{ padding:12, borderRadius:12, borderWidth:1, flexDirection:'row', alignItems:'center', justifyContent:'space-between' },
-  memberName:{ fontWeight:'600' },
+    drawerWrap:{ position:'absolute', top:0, bottom:0, left:0, width:'80%', backgroundColor:'#00000040', zIndex: 3000, elevation: 3000 },
+  drawerWrapRight:{ position:'absolute', top:0, bottom:0, right:0, width:'80%', backgroundColor:'#00000040', zIndex: 3000, elevation: 3000 },
+  drawer:{ flex:1, width:'100%', borderRightWidth:1, shadowColor:'#000', shadowOpacity:0.3, shadowRadius:20, shadowOffset:{width:0,height:0}, elevation: 3001, zIndex: 3001 },
+  drawerHeader:{ 
+    paddingHorizontal:20, 
+    paddingVertical:20, 
+    paddingTop: Platform.select({ ios: 20, android: 40 }), 
+    borderBottomWidth:1, 
+    flexDirection:'row', 
+    alignItems:'center', 
+    justifyContent:'space-between' 
+  },
+  drawerTitle:{ fontSize:18, fontWeight:'800', letterSpacing: 0.5 },
+  drawerClose:{ 
+    paddingVertical: 12, 
+    paddingHorizontal: 20, 
+    borderRadius: 20, 
+    borderWidth: 1.5, 
+    borderColor: '#ff4757',
+    backgroundColor: '#ff4757',
+    shadowColor:'#000', 
+    shadowOpacity:0.15, 
+    shadowRadius:6, 
+    shadowOffset:{width:0,height:3}, 
+    elevation: 3003,
+    zIndex: 3003,
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
 
-  sectionDivider:{ height:1, marginVertical:10 },
-  sectionTitle:{ fontWeight:'700', fontSize:14 },
+  groupRow:{ padding:16, borderRadius:16, borderWidth:1, flexDirection:'row', alignItems:'center', justifyContent:'space-between', shadowColor:'#000', shadowOpacity:0.05, shadowRadius:4, shadowOffset:{width:0,height:2}, elevation: 3 },
+  groupName:{ fontWeight:'700', fontSize: 15, letterSpacing: 0.3 },
+
+  memberRow:{ padding:16, borderRadius:16, borderWidth:1, flexDirection:'row', alignItems:'center', justifyContent:'space-between', shadowColor:'#000', shadowOpacity:0.05, shadowRadius:4, shadowOffset:{width:0,height:2}, elevation: 3 },
+  memberName:{ fontWeight:'600', fontSize: 15, letterSpacing: 0.3 },
+
+  sectionDivider:{ height:1, marginVertical:16, opacity: 0.6 },
+  sectionTitle:{ fontWeight:'700', fontSize:16, letterSpacing: 0.3, marginBottom: 4 },
   map:{ flex:1 },
+  
+  // Floating Action Button Styles
+  // Persistent Floating Button Styles - Super Cool Design with Premium Shadows
+  persistentButtonLeft:{ position:'absolute', top: Platform.select({ ios: 40, android: 60 }), left: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 1000 },
+  conquestModeButton:{ position:'absolute', top: Platform.select({ ios: 110, android: 130 }), left: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 1000 },
+  persistentButtonRightTop:{ position:'absolute', top: Platform.select({ ios: 40, android: 60 }), right: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 100 },
+  persistentButtonRightBottom:{ position:'absolute', top: Platform.select({ ios: 110, android: 130 }), right: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 100 },
+  persistentButtonPressable:{ flex: 1, justifyContent:'center', alignItems:'center' },
+  persistentButtonIcon:{ fontSize: 24, fontWeight: '700' },
+  premiumShadow:{ position:'absolute', width: 56, height: 56, borderRadius: 28, backgroundColor: 'transparent', shadowColor:'#000', shadowOpacity:0.6, shadowRadius:12, shadowOffset:{width:0,height:8}, elevation: 12, zIndex: 99 },
+  innerShadow:{ position:'absolute', width: 56, height: 56, borderRadius: 28, backgroundColor: 'transparent', shadowColor:'#fff', shadowOpacity:0.3, shadowRadius:4, shadowOffset:{width:0,height:-2}, elevation: 8, zIndex: 101 },
+  
+  // Leave Group Button Styles - Super Cool Design
+  leaveButtonContainerBelow:{ 
+    position:'relative', 
+    marginTop: 8,
+    marginBottom: 8,
+    alignItems:'center', 
+    zIndex: 10,
+    width: '100%'
+  },
+  leaveButton:{ 
+    paddingVertical: 12, 
+    paddingHorizontal: 20, 
+    borderRadius: 20, 
+    borderWidth: 1.5, 
+    borderColor: '#ff4757',
+    backgroundColor: '#ff4757',
+    shadowColor:'#000', 
+    shadowOpacity:0.2, 
+    shadowRadius:8, 
+    shadowOffset:{width:0,height:4}, 
+    elevation: 8,
+    minWidth: 120,
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  leaveButtonText:{ 
+    color:'white', 
+    fontWeight:'700', 
+    fontSize: 14, 
+    letterSpacing: 0.5,
+    textAlign: 'center'
+  },
+  
+  // Cleanup Button Styles
+  cleanupButton: {
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    borderRadius: 18,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  cleanupButtonText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 16,
+    letterSpacing: 0.3,
+  },
 });
+
