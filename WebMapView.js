@@ -39,7 +39,8 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
         <div id="map"></div>
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <script>
-            let map = L.map('map').setView([${region.latitude}, ${region.longitude}], 15);
+            // Prefer Canvas renderer for much faster polygon rendering on Android
+            let map = L.map('map', { preferCanvas: true }).setView([${region.latitude}, ${region.longitude}], 15);
             
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 attribution: '© OpenStreetMap contributors'
@@ -53,135 +54,197 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
                 // Location tracking disabled - no visual marker
             }
 
-            let hexagonLayers = [];
+            const canvasRenderer = L.canvas({ padding: 0.5 });
+            // Separate layers to prevent background from being wiped on frequent updates
+            let importantLayerGroup = L.layerGroup().addTo(map);
+            let backgroundLayerGroup = L.layerGroup().addTo(map);
+            let isDrawingImportant = false;
+            let pendingImportant = null;
+            let isDrawingBackground = false;
+            let pendingBackground = null;
+            let lastBackgroundCount = 0;
 
             function updateHexagons(hexagons) {
-                // Clear existing hexagons
-                hexagonLayers.forEach(layer => map.removeLayer(layer));
-                hexagonLayers = [];
-
-                if (hexagons.length === 0) {
+                // If an important draw is in progress, queue the latest update and return
+                if (isDrawingImportant) {
+                    pendingImportant = hexagons || [];
                     return;
                 }
 
-                // Add new hexagons
-                hexagons.forEach((hex, index) => {
-                    if (hex.coords && hex.coords.length > 0) {
-                        try {
-                            // Convert coordinates from {latitude, longitude} to [lat, lng] format for Leaflet
-                            const leafletCoords = hex.coords.map(coord => {
-                                if (coord && typeof coord.latitude === 'number' && typeof coord.longitude === 'number') {
-                                    return [coord.latitude, coord.longitude];
-                                }
-                                return null;
-                            }).filter(Boolean);
-                            
+                isDrawingImportant = true;
 
-                            
-                            if (leafletCoords.length >= 3) {
-                                                        // Enhanced styling based on hex type
-                        let style = {};
-                        
-                        if (hex.type === 'unclaimed') {
-                            style = {
-                                color: '#8B9DC3',
-                                weight: 1,
-                                fillColor: '#E8EAF6',
-                                fillOpacity: 0.2,
-                                opacity: 0.6,
-                                dashArray: '3, 3' // Dashed border for unclaimed
-                            };
-                        } else if (hex.type === 'claimed') {
-                            style = {
-                                color: hex.stroke || '#4CAF50',
-                                weight: 2,
-                                fillColor: hex.fill || '#4CAF50',
-                                fillOpacity: 0.4,
-                                opacity: 1
-                            };
-                        } else if (hex.type === 'owned') {
-                            if (hex.subtype === 'mine') {
-                                // My territory - solid and prominent
+                // Always clear and redraw important layer quickly
+                importantLayerGroup.clearLayers();
+
+                if (!hexagons || hexagons.length === 0) {
+                    isDrawingImportant = false;
+                    return;
+                }
+
+                // Split into important vs background to ensure unclaimed draw progressively
+                const important = [];
+                const background = [];
+                for (let i = 0; i < hexagons.length; i++) {
+                    const t = hexagons[i]?.type;
+                    if (t === 'unclaimed') background.push(hexagons[i]); else important.push(hexagons[i]);
+                }
+
+                // Batch sizes per frame
+                const importantBatch = 900;
+                const backgroundBatch = 700;
+                let impIndex = 0;
+                let bgIndex = 0;
+
+                function drawSome(list, start, count, targetGroup) {
+                    const end = Math.min(start + count, list.length);
+                    for (let i = start; i < end; i++) {
+                        const hex = list[i];
+                        if (!hex || !hex.coords || hex.coords.length < 3) continue;
+                        try {
+                            const leafletCoords = hex.coords
+                                .map(coord => (coord && typeof coord.latitude === 'number' && typeof coord.longitude === 'number')
+                                    ? [coord.latitude, coord.longitude]
+                                    : null)
+                                .filter(Boolean);
+                            if (leafletCoords.length < 3) continue;
+
+                            // Style
+                            let style = {};
+                            if (hex.type === 'unclaimed') {
+                                // Stronger, more visible background grid on Android
                                 style = {
-                                    color: hex.stroke || '#2196F3',
-                                    weight: hex.strokeWidth || 2.5,
-                                    fillColor: hex.fill || '#2196F3',
+                                    color: '#7f8aa5',
+                                    weight: 1.4,
+                                    fillColor: '#dae1f1',
+                                    fillOpacity: 0.35,
+                                    opacity: 0.9,
+                                    interactive: false,
+                                    renderer: canvasRenderer
+                                };
+                            } else if (hex.type === 'claimed') {
+                                style = {
+                                    color: hex.stroke || '#4CAF50',
+                                    weight: 2,
+                                    fillColor: hex.fill || '#4CAF50',
                                     fillOpacity: 0.4,
-                                    opacity: 0.9
+                                    opacity: 1,
+                                    renderer: canvasRenderer
                                 };
-                            } else {
-                                // Other player's territory - beautiful transparent
+                            } else if (hex.type === 'owned' || hex.type === 'my-territory' || hex.type === 'other-territory' || hex.type === 'shared') {
+                                const w = hex.strokeWidth || (hex.subtype === 'mine' ? 2.5 : 1.5);
                                 style = {
                                     color: hex.stroke || '#2196F3',
-                                    weight: hex.strokeWidth || 1.5,
+                                    weight: w,
                                     fillColor: hex.fill || '#2196F3',
-                                    fillOpacity: 0.15,
-                                    opacity: 0.7,
-                                    dashArray: '5, 5' // Dashed border for others
+                                    fillOpacity: (hex.subtype === 'mine') ? 0.4 : 0.15,
+                                    opacity: (hex.subtype === 'mine') ? 0.9 : 0.7,
+                                    dashArray: (hex.subtype === 'other') ? '5, 5' : null,
+                                    renderer: canvasRenderer
+                                };
+                            } else if (hex.type === 'live' || hex.type === 'local-claimed') {
+                                style = {
+                                    color: hex.stroke || '#FF5722',
+                                    weight: hex.strokeWidth || 3,
+                                    fillColor: hex.fill || '#FF5722',
+                                    fillOpacity: 0.6,
+                                    opacity: 1,
+                                    renderer: canvasRenderer
+                                };
+                            } else {
+                                style = {
+                                    color: hex.stroke || '#666',
+                                    weight: hex.strokeWidth || 2,
+                                    fillColor: hex.fill || '#666',
+                                    fillOpacity: 0.3,
+                                    opacity: 1,
+                                    renderer: canvasRenderer
                                 };
                             }
-                        } else if (hex.type === 'live') {
-                            // Live tracking (bright and prominent)
-                            style = {
-                                color: hex.stroke || '#FF5722',
-                                weight: hex.strokeWidth || 3,
-                                fillColor: hex.fill || '#FF5722',
-                                fillOpacity: 0.6,
-                                opacity: 1
-                            };
-                        } else {
-                            // Fallback style
-                            style = {
-                                color: hex.stroke || '#666',
-                                weight: hex.strokeWidth || 2,
-                                fillColor: hex.fill || '#666',
-                                fillOpacity: 0.3,
-                                opacity: 1
-                            };
-                        }
-                        
-                                                const polygon = L.polygon(leafletCoords, style).addTo(map);
-                        
-                        // Add hover effects for better interactivity
-                        polygon.on('mouseover', function() {
-                            this.setStyle({
-                                weight: (style.weight || 2) + 1,
-                                opacity: Math.min((style.opacity || 1) + 0.2, 1)
-                            });
-                        });
-                        
-                        polygon.on('mouseout', function() {
-                            this.setStyle(style);
-                        });
-                        
-                        // Add tooltip with hex info and owner
-                        if (hex.type) {
-                            let tooltipText = hex.type.charAt(0).toUpperCase() + hex.type.slice(1);
-                            if (hex.owner) {
-                                tooltipText += ' by ' + hex.owner;
+
+                            const polygon = L.polygon(leafletCoords, style);
+
+                            // Avoid heavy interactivity for unclaimed background
+                            if (hex.type !== 'unclaimed') {
+                                polygon.on('mouseover', function() {
+                                    this.setStyle({
+                                        weight: (style.weight || 2) + 1,
+                                        opacity: Math.min((style.opacity || 1) + 0.2, 1)
+                                    });
+                                });
+                                polygon.on('mouseout', function() {
+                                    this.setStyle(style);
+                                });
+                                if (hex.type) {
+                                    let tooltipText = hex.type.charAt(0).toUpperCase() + hex.type.slice(1);
+                                    if (hex.owner) {
+                                        tooltipText += ' by ' + hex.owner;
+                                    }
+                                    if (hex.subtype === 'mine') {
+                                        tooltipText = '👑 My Territory';
+                                    } else if (hex.subtype === 'other') {
+                                        tooltipText = '🏴 ' + (hex.owner || 'Other Player') + "'s Territory";
+                                    }
+                                    polygon.bindTooltip(tooltipText, { permanent: false, direction: 'center', className: 'hex-tooltip' });
+                                }
                             }
-                            if (hex.subtype === 'mine') {
-                                tooltipText = '👑 My Territory';
-                            } else if (hex.subtype === 'other') {
-                                tooltipText = '🏴 ' + (hex.owner || 'Other Player') + '\\'s Territory';
-                            }
-                            
-                            polygon.bindTooltip(tooltipText, {
-                                permanent: false,
-                                direction: 'center',
-                                className: 'hex-tooltip'
-                            });
-                        }
-                        
-                        hexagonLayers.push(polygon);
-                            } else {
-                                console.log('WebMap: Not enough valid coords for hex', index);
-                            }
-                        } catch (error) {
-                            // Silently handle error for production
+
+                            polygon.addTo(targetGroup);
+                        } catch (e) {
+                            // ignore
                         }
                     }
-                });
+
+                    return end;
+                }
+
+                function drawImportantThenBackground() {
+                    // Draw important layer fully, fast
+                    impIndex = drawSome(important, impIndex, importantBatch, importantLayerGroup);
+                    if (impIndex < important.length) {
+                        requestAnimationFrame(drawImportantThenBackground);
+                        return;
+                    }
+
+                    // Important done
+                    isDrawingImportant = false;
+                    if (pendingImportant) {
+                        const next = pendingImportant; pendingImportant = null;
+                        updateHexagons(next);
+                        return;
+                    }
+
+                    // Only rebuild background if changed
+                    if (background.length !== lastBackgroundCount) {
+                        lastBackgroundCount = background.length;
+                        queueBackgroundDraw(background);
+                    }
+                }
+
+                function queueBackgroundDraw(bgList) {
+                    if (isDrawingBackground) {
+                        pendingBackground = bgList;
+                        return;
+                    }
+                    isDrawingBackground = true;
+                    backgroundLayerGroup.clearLayers();
+
+                    let bgIndex = 0;
+                    function drawBgChunk() {
+                        bgIndex = drawSome(bgList, bgIndex, backgroundBatch, backgroundLayerGroup);
+                        if (bgIndex < bgList.length) {
+                            requestAnimationFrame(drawBgChunk);
+                            return;
+                        }
+                        isDrawingBackground = false;
+                        if (pendingBackground) {
+                            const nextBg = pendingBackground; pendingBackground = null;
+                            queueBackgroundDraw(nextBg);
+                        }
+                    }
+                    requestAnimationFrame(drawBgChunk);
+                }
+
+                requestAnimationFrame(drawImportantThenBackground);
             }
 
             // Listen for messages from React Native
@@ -248,11 +311,13 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
             
             // Fallback: check for hexagons after a delay
             setTimeout(function() {
-                if (hexagonLayers.length === 0) {
-                    window.ReactNativeWebView.postMessage(JSON.stringify({
-                        type: 'requestHexagons'
-                    }));
-                }
+                try {
+                    const imp = (importantLayerGroup && importantLayerGroup.getLayers) ? importantLayerGroup.getLayers().length : 0;
+                    const bg = (backgroundLayerGroup && backgroundLayerGroup.getLayers) ? backgroundLayerGroup.getLayers().length : 0;
+                    if ((imp + bg) === 0) {
+                        window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'requestHexagons' }));
+                    }
+                } catch (e) { /* ignore */ }
             }, 2000);
         </script>
     </body>
@@ -328,3 +393,4 @@ const WebMapView = forwardRef(({ initialRegion, hexagons, onRegionChange, style 
 });
 
 export default WebMapView; 
+

@@ -1,7 +1,7 @@
 // App.js — Clash of Trails (Expo)
 // Groups: direct DB create/join (no RPC). Hex grid always on. Live capture + bulk on stop.
 
-import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useCallback, useLayoutEffect } from 'react';
 import {
   Alert,
   SafeAreaView,
@@ -19,6 +19,7 @@ import {
   Switch,
   AppState,
   PanResponder,
+  Linking,
 } from 'react-native';
 import MapView, { Polygon, Marker } from 'react-native-maps';
 import WebMapView from './WebMapView';
@@ -30,9 +31,35 @@ import { supabase } from './lib/supabase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import HealthProfileSetup from './HealthProfileSetup';
 import * as Updates from 'expo-updates';
+import { Pedometer } from 'expo-sensors';
 
 /* ------------------ CONFIG ------------------ */
-const H3_RES = 9; // bigger hexes for outdoor territory claiming (trail-scale)
+const H3_RES = 9; // Keep consistent resolution across platforms for proper hex rendering
+
+// Performance optimizations for all platforms
+const PERFORMANCE_CONFIG = {
+  // Consistent animation duration
+  animationDuration: 1.0,
+  // Consistent shadow opacity
+  shadowOpacity: 1.0,
+  // Use hardware acceleration for all platforms
+  useHardwareAcceleration: true,
+  // Consistent render throttle
+  renderThrottle: 8, // 120fps for all platforms
+};
+
+// Performance optimization hook for all platforms
+const usePerformance = () => {
+  useLayoutEffect(() => {
+    // Enable performance optimizations for all platforms
+    if (global.__expo) {
+      // Expo-specific optimizations
+      global.__expo.performanceMode = true;
+    }
+  }, []);
+  
+  return PERFORMANCE_CONFIG;
+};
 
 /* ------------------ HELPERS ------------------ */
 const toRad = d => (d * Math.PI) / 180;
@@ -44,6 +71,21 @@ const haversine = (p1, p2) => {
 };
 const totalDistance = pts => pts.reduce((d,p,i)=> i ? d + haversine(pts[i-1], p) : 0, 0);
 const calcCalories = (m, s, w=70) => { const km=m/1000, h=s/3600, v=h?km/h:0; const MET = v>=10?10 : v>=8?8 : v>=6?6 : v>=4?3.5 : 2.8; return MET*w*h; };
+
+// Simple retry helper for transient failures (e.g., cold start, network hiccups)
+const retry = async (fn, retries = 3, baseDelayMs = 800) => {
+  let lastError;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      // Exponential backoff: baseDelay * (attempt + 1)
+      await new Promise(res => setTimeout(res, baseDelayMs * (attempt + 1)));
+    }
+  }
+  throw lastError;
+};
 
   // Helper functions for color manipulation
   function clamp(value, min, max) {
@@ -159,9 +201,10 @@ const Card = ({ children, style, theme }) => (
 const Label = ({ children, theme }) => (
   <Text style={[styles.label, { color: theme.text }]}>{children}</Text>
 );
-const Input = ({ theme, style, ...rest }) => (
+const Input = React.forwardRef(({ theme, style, ...rest }, ref) => (
   <View style={styles.inputContainer}>
   <TextInput
+    ref={ref}
     placeholderTextColor={theme.sub}
     {...rest}
     style={[
@@ -172,7 +215,7 @@ const Input = ({ theme, style, ...rest }) => (
   />
     <View style={[styles.inputGlow, { backgroundColor: theme.isDark ? 'rgba(79, 125, 243, 0.1)' : 'rgba(79, 125, 243, 0.05)' }]} />
   </View>
-);
+));
 const PrimaryButton = ({ title, onPress, disabled, theme }) => (
   <Pressable
     onPress={async()=>{ if(disabled) return; await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); onPress?.(); }}
@@ -233,12 +276,14 @@ function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupI
     }).start();
   }, [visible]);
 
-  // Sort members by hex count (highest first)
-  const sortedMembers = [...groupMembers].sort((a, b) => {
-    const aCount = memberHexCounts[a.userId] || 0;
-    const bCount = memberHexCounts[b.userId] || 0;
-    return bCount - aCount; // Descending order
-  });
+  // Sort members by hex count (highest first) - memoized for Android performance
+  const sortedMembers = useMemo(() => {
+    return [...groupMembers].sort((a, b) => {
+      const aCount = memberHexCounts[a.userId] || 0;
+      const bCount = memberHexCounts[b.userId] || 0;
+      return bCount - aCount; // Descending order
+    });
+  }, [groupMembers, memberHexCounts]);
   
 
 
@@ -258,7 +303,7 @@ function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupI
               ]}
             >
               <Text style={{color: 'white', fontWeight:'900', fontSize: 18}}>✕</Text>
-            </Pressable>
+          </Pressable>
           </View>
         </View>
 
@@ -360,17 +405,25 @@ function LeaderboardDrawer({ visible, onClose, theme, groupMembers, activeGroupI
 
 /* ------------------ PROFILE SECTION ------------------ */
 function ProfileSection({ theme, user, profile, onProfileUpdate, onOpenHealthSetup }) {
-  const [displayName, setDisplayName] = useState(profile?.display_name || '');
+  const [displayName, setDisplayName] = useState('');
   const [selectedColor, setSelectedColor] = useState(profile?.color || '#6aa2ff');
   const [isUpdating, setIsUpdating] = useState(false);
   const [updateError, setUpdateError] = useState('');
   const [updateSuccess, setUpdateSuccess] = useState('');
+  const inputRef = useRef(null);
 
   // Update local state when profile changes
   useEffect(() => {
-    setDisplayName(profile?.display_name || '');
+    setDisplayName(''); // keep the input empty until the user types
     setSelectedColor(profile?.color || '#6aa2ff');
   }, [profile]);
+
+  // Prevent auto-focus when component mounts
+  useEffect(() => {
+    if (inputRef.current) {
+      inputRef.current.blur();
+    }
+  }, []);
 
   const colors = [
     '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
@@ -380,7 +433,7 @@ function ProfileSection({ theme, user, profile, onProfileUpdate, onOpenHealthSet
 
   // Check if any changes have been made
   const hasChanges = () => {
-    const hasDisplayNameChanged = displayName.trim() !== (profile?.display_name || '');
+    const hasDisplayNameChanged = displayName.trim().length > 0 && displayName.trim() !== (profile?.display_name || '');
     const hasColorChanged = selectedColor !== (profile?.color || '#6aa2ff');
     return hasDisplayNameChanged || hasColorChanged;
   };
@@ -392,7 +445,7 @@ function ProfileSection({ theme, user, profile, onProfileUpdate, onOpenHealthSet
     }
     
     // Check if anything has changed
-    const hasDisplayNameChanged = displayName.trim() !== (profile?.display_name || '');
+    const hasDisplayNameChanged = displayName.trim().length > 0 && displayName.trim() !== (profile?.display_name || '');
     const hasColorChanged = selectedColor !== (profile?.color || '#6aa2ff');
     
     if (!hasDisplayNameChanged && !hasColorChanged) {
@@ -471,9 +524,13 @@ function ProfileSection({ theme, user, profile, onProfileUpdate, onOpenHealthSet
         <Text style={[styles.cardHint, { color: theme.sub }]}>New User Name</Text>
         <Input 
           theme={theme} 
-          value={""} 
+          value={displayName}
           onChangeText={setDisplayName}
           placeholder="Enter user name"
+          autoFocus={false}
+          blurOnSubmit={true}
+          editable={true}
+          ref={inputRef}
         />
       </View>
 
@@ -809,10 +866,17 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
         const suggestions = similarGroups.map(g => g.name).join(', ');
       }
       
+      // Get user's profile to use their display name
+      const { data: userProfile } = await supabase
+        .from('profiles')
+        .select('display_name')
+        .eq('id', authUser.id)
+        .single();
+      
       // Ensure profile exists before creating group
       const { error: profileError } = await supabase.from('profiles').upsert({
         id: authUser.id,
-        display_name: `Player${Date.now().toString().slice(-4)}`,
+        display_name: userProfile?.display_name || `Player${Date.now().toString().slice(-4)}`,
         color: '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
         group_id: null // Will be set when group is created
       }, { onConflict: 'id' });
@@ -903,10 +967,17 @@ function GroupsDrawer({ visible, onClose, activeGroupId, onSelectGroup, theme, r
         throw new Error('You are already a member of this group');
       }
 
+      // Get user's profile to use their display name
+      const { data: userProfile } = await supabase
+        .from('profiles')
+        .select('display_name')
+        .eq('id', authUser.id)
+        .single();
+
       // Ensure profile exists before joining group
       const { error: profileError } = await supabase.from('profiles').upsert({
         id: authUser.id,
-        display_name: `Player${Date.now().toString().slice(-4)}`,
+        display_name: userProfile?.display_name || `Player${Date.now().toString().slice(-4)}`,
         color: '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
         group_id: gid // Set the group ID when joining
       }, { onConflict: 'id' });
@@ -1091,6 +1162,9 @@ async function captureTerritoryGlobal(points, groupId, userId) {
 
 /* ------------------ MAIN APP ------------------ */
 export default function App(){
+  // Android performance optimizations
+  const performanceConfig = usePerformance();
+  
   const [isDark, setIsDark] = useState(true);
   const theme = useTheme(isDark);
 
@@ -1138,10 +1212,25 @@ export default function App(){
   const [pedometerAvailable, setPedometerAvailable] = useState(false);
   const [realStepCount, setRealStepCount] = useState(0);
   const [realCalories, setRealCalories] = useState(0);
+  const [sessionSteps, setSessionSteps] = useState(0);
+  const [sessionCalories, setSessionCalories] = useState(0);
+  const [pedometerSubscription, setPedometerSubscription] = useState(null);
+  const [lastStepCount, setLastStepCount] = useState(0);
+  const lastStepCountRef = useRef(0);
+  
+  // Performance optimization: Simple memoization for all platforms
+  const memoizedCells = useMemo(() => cells, [cells]);
   
   // OTA Update checking
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  
+  // Background location tracking state
+  const [backgroundLocationEnabled, setBackgroundLocationEnabled] = useState(false);
+  const [locationPermissionStatus, setLocationPermissionStatus] = useState(null);
+  const backgroundLocationTaskRef = useRef(null);
+  const locationSubscriptionRef = useRef(null);
   
 
 
@@ -1156,11 +1245,172 @@ export default function App(){
   const locationIntervalRef = useRef(null); // New ref for setInterval
   const locationCounterRef = useRef(0); // Counter for location updates
   const isTrackingRef = useRef(false); // Ref to track tracking state
+  const stepCheckIntervalRef = useRef(null); // Ref for step check interval
+  const subscriptionStepsRef = useRef(0); // Steps since subscription started
+  
+  // Performance optimization: Consistent update frequency
+  const updateThrottle = 500; // 0.5 seconds for all platforms
+  
+  // Performance optimization: Simple debounce for all platforms
+  const mapUpdateDebounceRef = useRef(null);
+  const debouncedMapUpdate = useCallback((updateFn) => {
+    if (mapUpdateDebounceRef.current) {
+      clearTimeout(mapUpdateDebounceRef.current);
+    }
+    mapUpdateDebounceRef.current = setTimeout(updateFn, 100); // Faster response
+  }, []);
+  
+  // Map performance: Simple configuration for all platforms
+  const mapConfig = useMemo(() => ({
+    // Reasonable polygon count for all platforms
+    maxPolygons: 500,
+    // Consistent update frequency
+    updateInterval: 1000,
+    // Keep full quality
+    simplifyPolygons: false,
+    // Consistent resolution
+    hexResolution: 9,
+  }), []);
+  
+  // Helper function to process all hexagons - defined BEFORE it's used
+  const processAllHexagons = useCallback((hexGrid, cells, claimedCells, localClaimedHexes, sharedHexagons, user, profile) => {
+    // Create lookup maps for O(1) access instead of O(n) searches
+    const cellsMap = new Map(cells.map(c => [c.h3_id, c]));
+    const claimedSet = new Set(claimedCells);
+    const localClaimedSet = new Set(localClaimedHexes);
+    
+    // Check if this hexagon is shared between multiple users
+    const isHexShared = (hexId) => {
+      const sharedUsers = sharedHexagons.get(hexId);
+      const isShared = sharedUsers && sharedUsers.length > 1;
+      return isShared;
+    };
+    
+    const result = Array.from(hexGrid).map(hexId => {
+      if (!hexId) return null;
+      
+      // Generate coordinates for this hex
+      const coords = polygonFromCell(hexId);
+      if (!coords) return null;
+      
+      const isClaimed = claimedSet.has(hexId);
+      const isLocalClaimed = localClaimedSet.has(hexId);
+      
+      // O(1) lookup instead of O(n) search
+      const ownerCell = cellsMap.get(hexId);
+      const isOwned = !!ownerCell;
+      const isMine = ownerCell?.user_id === user?.id;
+      
+      // Priority: Local Claimed > Claimed > Owned > Unclaimed
+      if (isLocalClaimed) {
+        // Locally claimed while walking - most prominent with pulsing effect
+        const base = profile?.color || '#6aa2ff';
+        
+        return {
+          id: hexId,
+          coords: coords,
+          fill: rgba(base, 0.8), // Very opaque for local claims
+          stroke: rgba(base, 1.0), // Solid border
+          strokeWidth: 4, // Consistent border width
+          type: 'local-claimed',
+          subtype: 'walking'
+        };
+      } else if (isOwned) {
+        // Check if this is a shared hexagon first
+        if (isHexShared(hexId)) {
+          // Shared territory - use unique purple/magenta color that no user can have
+          const sharedUsers = sharedHexagons.get(hexId);
+          const isMySharedTerritory = sharedUsers.includes(user?.id);
+          
+          return {
+            id: hexId,
+            coords: coords,
+            fill: 'rgba(128, 0, 128, 0.6)', // Unique purple/magenta for shared territory
+            stroke: 'rgba(128, 0, 128, 0.9)', // Solid purple/magenta border
+            strokeWidth: 4, // Thicker border for shared territory
+            type: 'shared',
+            subtype: isMySharedTerritory ? 'mine-shared' : 'other-shared',
+            sharedUsers: sharedUsers,
+            primaryOwner: ownerCell?.user_id,
+            ownerColor: ownerCell?.userColor || '#6aa2ff'
+          };
+        }
+        
+        // Regular owned territory (not shared) - use the ACTUAL owner's color
+        const ownerColor = ownerCell?.userColor;
+        
+        const base = ownerColor || '#6aa2ff'; // Fallback to blue if no color
+        const isMyTerritory = ownerCell?.user_id === user?.id;
+        
+        if (isMyTerritory) {
+          // My territory - solid and prominent
+          return {
+            id: hexId,
+            coords: coords,
+            fill: rgba(base, 0.6), // Consistent opacity for my territory
+            stroke: rgba(base, 1.0), // Solid border
+            strokeWidth: 3, // Consistent border width
+            type: 'my-territory',
+            subtype: 'owned'
+          };
+        } else {
+          // Other user's territory - use their color with medium opacity
+          return {
+            id: hexId,
+            coords: coords,
+            fill: rgba(base, 0.3), // Consistent opacity for other territory
+            stroke: rgba(base, 0.9), // Strong border in their color
+            strokeWidth: 2.5, // Consistent border width
+            type: 'other-territory',
+            subtype: 'owned',
+            owner: ownerCell?.user_id,
+            ownerColor: base
+          };
+        }
+      } else if (isClaimed) {
+        // Claimed but not yet owned - use medium opacity
+        const base = profile?.color || '#6aa2ff';
+        
+        return {
+          id: hexId,
+          coords: coords,
+          fill: rgba(base, 0.5), // Medium opacity
+          stroke: rgba(base, 0.8), // Medium border
+          strokeWidth: Platform.OS === 'android' ? 3 : 2, // Medium border thickness
+          type: 'claimed',
+          subtype: 'pending'
+        };
+      } else {
+        // Unclaimed hexagon - subtle grid appearance
+        return {
+          id: hexId,
+          coords: coords,
+          fill: Platform.OS === 'android'
+            ? (theme.isDark ? 'rgba(100, 110, 130, 0.15)' : 'rgba(200, 210, 230, 0.2)') // Android rgba
+            : (theme.isDark ? 'rgba(100, 110, 130, 0.2)' : 'rgba(200, 210, 230, 0.3)'), // iOS rgba
+          stroke: Platform.OS === 'android'
+            ? (theme.isDark ? 'rgba(160, 170, 190, 0.9)' : 'rgba(140, 150, 170, 0.9)') // Android rgba
+            : (theme.isDark ? 'rgba(160, 170, 190, 0.8)' : 'rgba(140, 150, 170, 0.8)'), // iOS rgba
+          strokeWidth: 1.5, // Slightly thicker for visibility
+          type: 'unclaimed'
+        };
+      }
+    }).filter(Boolean);
+    
+    return result;
+  }, []);
 
   // Enhanced bottom sheet with pull-up functionality
   const sheetY = useRef(new Animated.Value(0)).current;
   const sheetHeight = useRef(new Animated.Value(200)).current;
   const isExpanded = useRef(false);
+  
+  // Animation configuration: Consistent across platforms
+  const animationConfig = useMemo(() => ({
+    duration: 300,
+    easing: Easing.out(Easing.cubic),
+    useNativeDriver: true
+  }), []);
   
   // Hex info modal functionality
   const handleHexTap = async (hexId) => {
@@ -1222,13 +1472,28 @@ export default function App(){
       try {
         const isAvailable = await Pedometer.isAvailableAsync();
         setPedometerAvailable(isAvailable);
+        // console.log('👟 Pedometer available:', isAvailable);
       } catch (error) {
         setPedometerAvailable(false);
+        // console.log('❌ Pedometer not available:', error.message);
       }
     };
     
     checkPedometerAvailability();
-  }, []);
+    
+    // Set up periodic daily reset check (every hour)
+    const dailyResetInterval = setInterval(() => {
+      resetDailyFitness();
+    }, 60 * 60 * 1000); // Check every hour
+    
+    return () => {
+      clearInterval(dailyResetInterval);
+      // Clean up pedometer subscription if it exists
+      if (pedometerSubscription) {
+        pedometerSubscription.remove();
+      }
+    };
+  }, [resetDailyFitness, pedometerSubscription]);
   
   // OTA Update checking
   useEffect(() => {
@@ -1238,7 +1503,18 @@ export default function App(){
         const update = await Updates.checkForUpdateAsync();
         if (update.isAvailable) {
           setUpdateAvailable(true);
-          console.log('🔄 Update available!');
+          console.log('🔄 Update available:', update.manifest?.version || 'Unknown version');
+          
+          // Auto-download update for better user experience
+          try {
+            console.log('📥 Auto-downloading update...');
+            await Updates.fetchUpdateAsync();
+            console.log('✅ Update downloaded successfully');
+          } catch (downloadError) {
+            console.log('⚠️ Auto-download failed:', downloadError.message);
+          }
+        } else {
+          console.log('✅ App is up to date');
         }
       } catch (error) {
         console.log('Update check failed:', error);
@@ -1261,18 +1537,81 @@ export default function App(){
     try {
       setUpdateAvailable(false);
       setIsCheckingUpdate(true);
+      setUpdateProgress(0);
       
-      const result = await Updates.fetchUpdateAsync();
-      if (result.isNew) {
-        await Updates.reloadAsync();
+      console.log('🔄 Applying update...');
+      
+      // Check if update is already downloaded
+      const update = await Updates.checkForUpdateAsync();
+      if (update.isAvailable) {
+        console.log('✅ Update ready, reloading app...');
+        setUpdateProgress(100);
+        setTimeout(() => Updates.reloadAsync(), 500);
+      } else {
+        console.log('📥 Downloading update...');
+        setUpdateProgress(50);
+        await Updates.fetchUpdateAsync();
+        console.log('✅ Update downloaded, reloading app...');
+        setUpdateProgress(100);
+        setTimeout(() => Updates.reloadAsync(), 500);
       }
     } catch (error) {
       console.log('Update failed:', error);
       setUpdateAvailable(true); // Re-enable update button
+      setUpdateProgress(0);
+      Alert.alert('Update Failed', 'Failed to apply the update. Please try again.');
     } finally {
       setIsCheckingUpdate(false);
     }
   }, []);
+  
+  // Enhanced OTA update notification
+  const renderOTAUpdateNotification = () => {
+    if (!updateAvailable) return null;
+    
+    return (
+      <View style={[styles.otaUpdateContainer, { 
+        backgroundColor: theme.primary,
+        borderColor: theme.border 
+      }]}>
+        <View style={styles.otaUpdateContent}>
+          <Text style={[styles.otaUpdateTitle, { color: '#ffffff' }]}>
+            🔄 Update Available!
+          </Text>
+          <Text style={[styles.otaUpdateText, { color: '#ffffff' }]}>
+            A new version is ready to install
+          </Text>
+          
+          {isCheckingUpdate && (
+            <View style={styles.updateProgressContainer}>
+              <View style={[styles.updateProgressBar, { backgroundColor: 'rgba(255,255,255,0.3)' }]}>
+                <View style={[styles.updateProgressFill, { 
+                  backgroundColor: '#ffffff',
+                  width: `${updateProgress}%`
+                }]} />
+              </View>
+              <Text style={[styles.updateProgressText, { color: '#ffffff' }]}>
+                {updateProgress}%
+              </Text>
+            </View>
+          )}
+          
+          <TouchableOpacity
+            style={[styles.updateButton, { 
+              backgroundColor: '#ffffff',
+              opacity: isCheckingUpdate ? 0.6 : 1
+            }]}
+            onPress={applyUpdate}
+            disabled={isCheckingUpdate}
+          >
+            <Text style={[styles.updateButtonText, { color: theme.primary }]}>
+              {isCheckingUpdate ? 'Updating...' : 'Update Now'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
   
   // Real-time health tracking
   const startHealthTracking = useCallback(async () => {
@@ -1471,21 +1810,56 @@ export default function App(){
 
   /* ----- auth/session bootstrap ----- */
   useEffect(()=>{
+    // Seed session immediately to avoid null flashes
     supabase.auth.getSession().then(({data:{session}})=>setUser(session?.user ?? null));
+
     const { data: sub } = supabase.auth.onAuthStateChange(async (_e,s)=>{
       setUser(s?.user ?? null);
-      if (s?.user) {
-        await supabase.rpc('ensure_profile_ready', { p_display_name: displayName || 'Player' });
-        const { data } = await supabase.from('profiles').select('display_name,color,height_cm,weight_kg,age,activity_level').eq('id', s.user.id).single();
-        if (data) {
-          setProfile(data);
-          // Set default color if none exists
-          if (!data.color) {
+      if (!s?.user) {
+        setProfile(null); 
+        setActiveGroupId(null);
+        return;
+      }
+
+      // Ensure profile exists with a resilient retry (handles race at first app open)
+      await retry(() => supabase.rpc('ensure_profile_ready', { p_display_name: s?.user?.user_metadata?.display_name || profile?.display_name || displayName || 'Player' }));
+
+      // Fetch profile with retry to avoid cold-start race/network hiccup
+      const prof = await retry(async () => {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('display_name,color,height_cm,weight_kg,age,activity_level')
+          .eq('id', s.user.id)
+          .single();
+        if (error) throw error;
+        return data;
+      });
+      setProfile(prof);
+
+      // Ensure default color exists
+      if (!prof?.color) {
             await supabase.from('profiles').update({ color: '#6aa2ff' }).eq('id', s.user.id);
           }
+
+      // Preload groups reliably so first landing shows them (avoid stale closure on first render)
+      try {
+        const groupsData = await retry(async () => {
+          const { data, error } = await supabase
+            .from('group_members')
+            .select('group_id, groups(name)')
+            .eq('user_id', s.user.id)
+            .order('joined_at', { ascending: true });
+          if (error) throw error;
+          return data || [];
+        });
+
+        const formattedGroups = groupsData.map(r => ({ id: r.group_id, name: r.groups?.name || 'Group' }));
+        setGroups(formattedGroups);
+        if (!activeGroupId && formattedGroups.length > 0) {
+          setActiveGroupId(formattedGroups[0].id);
         }
-      } else {
-        setProfile(null); setActiveGroupId(null);
+      } catch (_) {
+        // Ignore, second-stage effect will retry
       }
     });
     return ()=>sub?.subscription?.unsubscribe?.();
@@ -1494,15 +1868,28 @@ export default function App(){
   useEffect(()=>{
     if(!user) return;
     (async()=>{
-      await supabase.rpc('ensure_profile_ready', { p_display_name: displayName || 'Player' });
-      const { data: prof } = await supabase.from('profiles').select('display_name,color,height_cm,weight_kg,age,activity_level').eq('id', user.id).single();
+      // Ensure profile is ready and fetch with retry to avoid empty home on cold start
+      await retry(() => supabase.rpc('ensure_profile_ready', { p_display_name: user?.user_metadata?.display_name || profile?.display_name || displayName || 'Player' }));
+      const prof = await retry(async () => {
+        const { data } = await supabase
+          .from('profiles')
+          .select('display_name,color,height_cm,weight_kg,age,activity_level')
+          .eq('id', user.id)
+          .single();
+        return data;
+      });
       if (prof) setProfile(prof);
-      const { data } = await supabase.from('group_members').select('group_id').eq('user_id', user.id).order('joined_at',{ascending:true}).limit(1);
+
+      // Load groups and set an initial active group when available
+      await retry(async () => { await fetchUserGroups(); });
+      const { data } = await supabase
+        .from('group_members')
+        .select('group_id')
+        .eq('user_id', user.id)
+        .order('joined_at',{ascending:true})
+        .limit(1);
       if (data?.length) setActiveGroupId(data[0].group_id);
-      
-      // Fetch user groups for header display
-      fetchUserGroups();
-      
+
       // Fetch daily fitness data
       fetchDailyFitness();
     })();
@@ -1523,7 +1910,7 @@ export default function App(){
           resetDailyFitness();
         }
       } catch (error) {
-        console.log('❌ Error checking new day:', error);
+        // console.log('❌ Error checking new day:', error);
       }
     };
     
@@ -1652,7 +2039,7 @@ export default function App(){
   const fetchCells = useCallback(async () => {
     if (!activeGroupId || !user?.id) return;
     
-    console.log('🔄 fetchCells called for group:', activeGroupId.slice(-8));
+    // console.log('🔄 fetchCells called for group:', activeGroupId.slice(-8));
     
     try {
       // SIMPLE: Just get all hexagons in the current group
@@ -1660,7 +2047,7 @@ export default function App(){
         .from('captured_cells')
         .select('h3_id, user_id, group_id, claimed_at')
         .eq('group_id', activeGroupId);
-      
+
       if (groupError) {
         console.log('Error fetching group hexagons:', groupError);
         return;
@@ -1673,7 +2060,7 @@ export default function App(){
         return;
       }
       
-      console.log('🎯 Found', groupHexagons.length, 'hexagons in group');
+              // console.log('🎯 Found', groupHexagons.length, 'hexagons in group');
       
       // SIMPLE: For each hexagon, find the most recent claim
       const hexagonOwnership = new Map(); // h3_id -> { user_id, claimed_at }
@@ -1692,7 +2079,7 @@ export default function App(){
       });
       
       const uniqueHexagons = Array.from(hexagonOwnership.values());
-      console.log('🎯 Unique hexagons after deduplication:', uniqueHexagons.length);
+              // console.log('🎯 Unique hexagons after deduplication:', uniqueHexagons.length);
       
       // Set claimed cells for the grid
       const dbCellIds = uniqueHexagons.map(hex => hex.h3_id);
@@ -1701,7 +2088,7 @@ export default function App(){
       // SIMPLE: Get user profiles for colors
       const userIds = [...new Set(uniqueHexagons.map(hex => hex.user_id))];
       const { data: profiles, error: profileError } = await supabase
-        .from('profiles')
+          .from('profiles')
         .select('id, color, display_name')
         .in('id', userIds);
       
@@ -1711,7 +2098,7 @@ export default function App(){
       }
       
       if (profiles && profiles.length > 0) {
-        console.log('🎨 Fetched profiles for colors:', profiles.length, 'users');
+        // console.log('🎨 Fetched profiles for colors:', profiles.length, 'users');
         
         // Create color map
         const profileMap = new Map(profiles.map(p => [p.id, p.color]));
@@ -1724,7 +2111,7 @@ export default function App(){
           displayName: displayNameMap.get(hex.user_id) || `User${hex.user_id.slice(-4)}`
         }));
         
-        console.log('🎨 Created', cellsWithColors.length, 'hexagons with colors');
+        // console.log('🎨 Created', cellsWithColors.length, 'hexagons with colors');
         
         // SIMPLE: Check for shared hexagons (multiple users within 10 minutes)
         const sharedHexagonsMap = new Map();
@@ -1759,10 +2146,10 @@ export default function App(){
                 if (timeDiff <= tenMinutes) {
                   // Shared within 10 minutes
                   sharedHexagonsMap.set(hexId, uniqueUsers);
-                  console.log('🔍 Shared hexagon:', hexId.slice(-8), 'between users:', uniqueUsers);
+                  // console.log('🔍 Shared hexagon:', hexId.slice(-8), 'between users:', uniqueUsers);
                 } else {
                   // Conquest - belongs to newest
-                  console.log('🔍 Conquest hexagon:', hexId.slice(-8), 'winner:', newest.user_id.slice(-8));
+                  // console.log('🔍 Conquest hexagon:', hexId.slice(-8), 'winner:', newest.user_id.slice(-8));
                 }
               }
             }
@@ -1773,7 +2160,7 @@ export default function App(){
         setSharedHexagons(sharedHexagonsMap);
         
         // FINALLY: Set the cells with colors
-        console.log('🎯 Setting', cellsWithColors.length, 'hexagons with colors');
+        // console.log('🎯 Setting', cellsWithColors.length, 'hexagons with colors');
         setCells(cellsWithColors);
         
       } else {
@@ -1879,7 +2266,7 @@ export default function App(){
     if (!activeGroupId || !user?.id) return;
     
     const intervalId = setInterval(() => {
-      console.log('🔄 Periodic refresh - updating map and leaderboard...');
+      // console.log('🔄 Periodic refresh - updating map and leaderboard...');
       fetchCells();
       fetchMemberHexCounts();
     }, 30000); // 30 seconds
@@ -1897,13 +2284,26 @@ export default function App(){
           fetchMemberHexCounts();
         }, 1000);
       }
+      
+      // Handle background location tracking based on app state
+      if (nextAppState === 'background' && isTracking && backgroundLocationEnabled) {
+        // App going to background - ensure background tracking is active
+        // console.log('📱 App going to background - background tracking active');
+      } else if (nextAppState === 'active' && isTracking && backgroundLocationEnabled) {
+        // App coming to foreground - refresh data and ensure tracking is active
+        // console.log('📱 App coming to foreground - refreshing data');
+        setTimeout(() => {
+          fetchCells();
+          fetchMemberHexCounts();
+        }, 500);
+      }
     };
     
     // Listen for app state changes
     const subscription = AppState.addEventListener('change', handleAppStateChange);
     
     return () => subscription?.remove();
-  }, [activeGroupId, user?.id, fetchCells, fetchMemberHexCounts]);
+  }, [activeGroupId, user?.id, fetchCells, fetchMemberHexCounts, isTracking, backgroundLocationEnabled]);
 
   const fetchCellsDebounced = useCallback(() => {
     if (fetchCellsTimer.current) clearTimeout(fetchCellsTimer.current);
@@ -1964,7 +2364,7 @@ export default function App(){
       
       // Set members directly (no merging needed for group switching)
       setGroupMembers(formattedMembers);
-      console.log('✅ Group members set:', formattedMembers.length, 'members');
+              // console.log('✅ Group members set:', formattedMembers.length, 'members');
       
     } catch (e) {
       console.log('❌ fetchGroupMembers error:', e);
@@ -1977,7 +2377,7 @@ export default function App(){
     if (!user?.id) return;
     
     try {
-      console.log('🔍 Fetching user groups...', isManualRefresh ? '(manual refresh)' : '(auto refresh)');
+              // console.log('🔍 Fetching user groups...', isManualRefresh ? '(manual refresh)' : '(auto refresh)');
       
       const { data, error } = await supabase
         .from('group_members')
@@ -1995,16 +2395,16 @@ export default function App(){
         name: r.groups?.name || 'Group' 
       }));
       
-      console.log('🔍 Fetched groups:', formattedGroups.length, 'groups');
+              // console.log('🔍 Fetched groups:', formattedGroups.length, 'groups');
       
       // Only update state if this is a manual refresh or if the groups have actually changed
       setGroups(prevGroups => {
         const hasChanged = JSON.stringify(prevGroups) !== JSON.stringify(formattedGroups);
         if (hasChanged || isManualRefresh) {
-          console.log('✅ Updating groups state:', prevGroups.length, '→', formattedGroups.length);
+          // console.log('✅ Updating groups state:', prevGroups.length, '→', formattedGroups.length);
           return formattedGroups;
         } else {
-          console.log('⏭️ Skipping groups state update (no changes)');
+          // console.log('⏭️ Skipping groups state update (no changes)');
           return prevGroups;
         }
       });
@@ -2018,7 +2418,12 @@ export default function App(){
     if (!user?.id) return;
     
     try {
-      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+      // First check if we need to reset for a new day
+      await resetDailyFitness();
+      
+      // Use device-local date for today to avoid timezone errors
+      const today = new Date().toISOString().split('T')[0];
+      
       const { data, error } = await supabase
         .from('daily_fitness')
         .select('steps, calories_burned')
@@ -2055,7 +2460,7 @@ export default function App(){
     } catch (error) {
       console.log('❌ Error in fetchDailyFitness:', error);
     }
-  }, [user?.id]);
+  }, [user?.id, resetDailyFitness]);
 
   const updateDailyFitness = useCallback(async (newSteps, newCalories) => {
     if (!user?.id) return;
@@ -2083,49 +2488,60 @@ export default function App(){
     }
   }, [user?.id]);
 
-  // Reset daily fitness data at midnight
+  // Reset daily fitness data at midnight based on user's device timezone
   const resetDailyFitness = useCallback(async () => {
     if (!user?.id) return;
     
     try {
-      const today = new Date().toISOString().split('T')[0];
-      const { error } = await supabase
-        .from('daily_fitness')
-        .upsert({
-          user_id: user.id,
-          date: today,
-          steps: 0,
-          calories_burned: 0
-        }, { onConflict: 'user_id,date' });
-      
-      if (error) {
-        // Silently handle error for production
-        return;
+      // Use device's timezone safely
+      let userTimezone = 'UTC';
+      try {
+        userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      } catch (tzError) {
+        // console.log('⚠️ Could not get timezone, using UTC');
       }
       
-      setDailySteps(0);
-      setDailyCalories(0);
+      const now = new Date();
+      // Create today start date safely without timezone conversion
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const tomorrowStart = new Date(todayStart);
+      tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+      
+      // Check if we've crossed midnight
+      if (now >= tomorrowStart) {
+        console.log(`🕛 Daily reset detected in timezone: ${userTimezone}`);
+        
+        const { error } = await supabase
+          .from('daily_fitness')
+          .upsert({
+            user_id: user.id,
+            date: now.toISOString().split('T')[0], // Use ISO date format
+            steps: 0,
+            calories_burned: 0
+          }, { onConflict: 'user_id,date' });
+        
+        if (error) {
+          console.log('❌ Error resetting daily fitness:', error);
+          return;
+        }
+        
+        setDailySteps(0);
+        setDailyCalories(0);
+        setSessionSteps(0);
+        setSessionCalories(0);
+        setLastStepCount(0);
+        lastStepCountRef.current = 0;
+        // console.log('✅ Daily fitness reset completed');
+      } else {
+        // console.log(`🕐 Current time in timezone: ${userTimezone} - No reset needed`);
+      }
     } catch (error) {
-      // Silently handle error for production
+      console.log('❌ Error in resetDailyFitness:', error);
     }
   }, [user?.id]);
 
-  // Simulate step counting and calorie burning based movement
-  const simulateFitnessTracking = useCallback(() => {
-    if (!isTracking) return;
-    
-    try {
-      // Simulate steps based on location changes (roughly 1 step per 0.5 meters)
-      const newSteps = dailySteps + Math.floor(Math.random() * 3) + 1; // 1-3 steps per update
-      
-      // Calculate calories (roughly 0.04 calories per step for walking)
-      const newCalories = Math.round(newSteps * 0.04);
-      
-      updateDailyFitness(newSteps, newCalories);
-    } catch (error) {
-      // Silently handle error for production
-    }
-  }, [isTracking, dailySteps, updateDailyFitness]);
+
 
   // Function to leave a group
   const leaveGroup = useCallback(async (groupId) => {
@@ -2348,7 +2764,7 @@ export default function App(){
     if (!activeGroupId) return;
     
     try {
-      console.log('🏆 fetchMemberHexCounts called for group:', activeGroupId.slice(-8));
+      // console.log('🏆 fetchMemberHexCounts called for group:', activeGroupId.slice(-8));
       
       // SIMPLE: Just get all hexagons in the current group (same as fetchCells)
       const { data: groupHexagons, error: groupError } = await supabase
@@ -2368,7 +2784,7 @@ export default function App(){
         return;
       }
       
-      console.log('🏆 Found', groupHexagons.length, 'hexagons for leaderboard');
+      // console.log('🏆 Found', groupHexagons.length, 'hexagons for leaderboard');
       
       // SIMPLE: For each hexagon, find the most recent claim (same logic as fetchCells)
       const hexagonOwnership = new Map(); // h3_id -> { user_id, claimed_at }
@@ -2387,7 +2803,7 @@ export default function App(){
       });
       
       const uniqueHexagons = Array.from(hexagonOwnership.values());
-      console.log('🏆 Unique hexagons for leaderboard:', uniqueHexagons.length);
+      // console.log('🏆 Unique hexagons for leaderboard:', uniqueHexagons.length);
       
       // CRITICAL: Count hexagons per user, including shared hexagons
       const counts = {};
@@ -2430,7 +2846,7 @@ export default function App(){
               if (timeDiff <= tenMinutes) {
                 // Shared within 10 minutes - each user gets 1 point
                 sharedHexagons.set(hexId, uniqueUsers);
-                console.log('🏆 Shared hexagon in leaderboard:', hexId.slice(-8), 'between users:', uniqueUsers);
+                // console.log('🏆 Shared hexagon in leaderboard:', hexId.slice(-8), 'between users:', uniqueUsers);
                 
                 // IMPORTANT: For shared hexagons, each user gets 1 point
                 uniqueUsers.forEach(userId => {
@@ -2445,39 +2861,39 @@ export default function App(){
                 }
               } else {
                 // Conquest - belongs to newest
-                console.log('🏆 Conquest hexagon in leaderboard:', hexId.slice(-8), 'winner:', newest.user_id.slice(-8));
+                // console.log('🏆 Conquest hexagon in leaderboard:', hexId.slice(-8), 'winner:', newest.user_id.slice(-8));
               }
             }
           }
         }
       });
       
-      console.log('🏆 Final leaderboard counts:', counts);
-      console.log('🏆 Shared hexagons in leaderboard:', sharedHexagons.size);
+      // console.log('🏆 Final leaderboard counts:', counts);
+      // console.log('🏆 Shared hexagons in leaderboard:', sharedHexagons.size);
       
       // Debug: Show detailed counting breakdown
-      if (sharedHexagons.size > 0) {
-        console.log('🏆 Shared hexagon breakdown:');
-        sharedHexagons.forEach((users, hexId) => {
-          console.log(`  Hexagon ${hexId.slice(-8)}: ${users.length} users sharing`);
-          users.forEach(userId => {
-            console.log(`    User ${userId.slice(-8)}: ${counts[userId]} total hexagons`);
-          });
-        });
-      }
+      // if (sharedHexagons.size > 0) {
+      //   console.log('🏆 Shared hexagon breakdown:');
+      //   sharedHexagons.forEach((users, hexId) => {
+      //     console.log(`  Hexagon ${hexId.slice(-8)}: ${users.length} users sharing`);
+      //       users.forEach(userId => {
+      //         console.log(`    User ${userId.slice(-8)}: ${counts[userId]} total hexagons`);
+      //       });
+      //   });
+      // }
       
       // Update the leaderboard
       setMemberHexCounts(counts);
       
       // Clear loading state
       setIsLeaderboardLoading(false);
-      console.log('✅ Leaderboard updated successfully');
+      // console.log('✅ Leaderboard updated successfully');
       
       // Final verification: Show what each user should have
-      console.log('🏆 Final verification - User hexagon counts:');
-      Object.entries(counts).forEach(([userId, count]) => {
-        console.log(`  User ${userId.slice(-8)}: ${count} hexagons`);
-      });
+      // console.log('🏆 Final verification - User hexagon counts:');
+      // Object.entries(counts).forEach(([userId, count]) => {
+      //   console.log(`  User ${userId.slice(-8)}: ${count} hexagons`);
+      // });
       
     } catch (e) {
       console.log('❌ fetchMemberHexCounts error:', e);
@@ -2545,12 +2961,12 @@ export default function App(){
       // Use a fallback location if no user location is available
       const fallbackLat = 37.7749; // Default latitude (San Francisco)
       const fallbackLon = -122.4194; // Default longitude
-      console.log('🔄 Regenerating hex grid for new group location...');
+              // console.log('🔄 Regenerating hex grid for new group location...');
       generateHexGrid(fallbackLat, fallbackLon, false, conquestMode);
       
       // Debug: Check if hex grid is being generated
       setTimeout(() => {
-        console.log('🔍 Debug: Hex grid size after regeneration:', allHexGrid?.size || 0);
+        // console.log('🔍 Debug: Hex grid size after regeneration:', allHexGrid?.size || 0);
       }, 500);
       
       // Update the ref to track the change
@@ -2734,7 +3150,12 @@ export default function App(){
   const signOut=async()=>{ await supabase.auth.signOut(); setActiveGroupId(null); };
 
   /* ----- tracking ----- */
-  useEffect(()=>{ if(!isTracking) return; const id=setInterval(()=>setElapsed(Date.now()-startTime),1000); return ()=>clearInterval(id); },[isTracking,startTime]);
+  useEffect(()=>{ 
+    if(!isTracking) return; 
+    const interval = 1000; // 1 second for all platforms
+    const id=setInterval(()=>setElapsed(Date.now()-startTime), interval); 
+    return ()=>clearInterval(id); 
+  },[isTracking,startTime]);
 
   // Cleanup location interval when component unmounts or tracking stops
   useEffect(() => {
@@ -2743,8 +3164,31 @@ export default function App(){
         clearInterval(locationIntervalRef.current);
         locationIntervalRef.current = null;
       }
+      
+      // Stop background location tracking on unmount
+      if (locationSubscriptionRef.current) {
+        locationSubscriptionRef.current.remove();
+      }
     };
   }, []);
+  
+  // Handle app termination
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      handleAppTermination();
+    };
+    
+    // Listen for app termination events
+    if (Platform.OS === 'web') {
+      window.addEventListener('beforeunload', handleBeforeUnload);
+    }
+    
+    return () => {
+      if (Platform.OS === 'web') {
+        window.removeEventListener('beforeunload', handleBeforeUnload);
+      }
+    };
+  }, [handleAppTermination]);
 
   // Additional cleanup when tracking state changes
   useEffect(() => {
@@ -2793,6 +3237,15 @@ export default function App(){
         clearInterval(locationIntervalRef.current);
         locationIntervalRef.current = null;
       }
+      
+      // Clear the step check interval
+      if (stepCheckIntervalRef.current) {
+        clearInterval(stepCheckIntervalRef.current);
+        stepCheckIntervalRef.current = null;
+      }
+      
+      // Stop background location tracking
+      await stopBackgroundLocationTracking();
       
       // Process all collected points and claim hexagons in ALL groups the user is part of
       if (points.length > 0 && user?.id) {
@@ -2921,7 +3374,7 @@ export default function App(){
           }
           
           if (totalNewClaims > 0 || totalSharedClaims > 0) {
-            console.log(`🎉 Total claims across all groups: New: ${totalNewClaims}, Shared: ${totalSharedClaims}, Already yours: ${totalAlreadyClaimed}`);
+            // console.log(`🎉 Total claims across all groups: New: ${totalNewClaims}, Shared: ${totalSharedClaims}, Already yours: ${totalAlreadyClaimed}`);
             
             // Show detailed information about shared hexagons
             let sharedDetails = '';
@@ -2938,8 +3391,8 @@ export default function App(){
               [{ text: 'Awesome!', style: 'default' }]
             );
           } else {
-            console.log('⏭️ No new hexagons to claim in any group');
-            console.log('🔍 Debug: This might indicate a database issue or logic problem');
+            // console.log('⏭️ No new hexagons to claim in any group');
+            // console.log('🔍 Debug: This might indicate a database issue or logic problem');
             Alert.alert('No New Territory', 'All hexagons on this trail were already claimed in all your groups!');
           }
           
@@ -2955,7 +3408,7 @@ export default function App(){
       setTimeout(async () => {
         await fetchGroupMembers();
         if (activeGroupId) {
-          console.log('🔄 Delayed refresh after stop - ensuring colors are displayed...');
+          // console.log('🔄 Delayed refresh after stop - ensuring colors are displayed...');
           await fetchCells();
           await fetchMemberHexCounts();
         }
@@ -2963,7 +3416,7 @@ export default function App(){
       
       // IMMEDIATE refresh to show colors right away
       if (activeGroupId) {
-        console.log('🔄 Immediate refresh after stop - showing colors now...');
+        // console.log('🔄 Immediate refresh after stop - showing colors now...');
         setTimeout(async () => {
           await fetchCells();
           await fetchMemberHexCounts(); // Also refresh leaderboard immediately
@@ -2977,6 +3430,13 @@ export default function App(){
       
       // Clear local claimed hexes (they're now saved to database)
       setLocalClaimedHexes(new Set());
+      
+      // Stop pedometer tracking
+      if (pedometerSubscription) {
+        pedometerSubscription.remove();
+        setPedometerSubscription(null);
+                  // console.log('👟 Pedometer tracking stopped');
+      }
       
       // Calculate and log session stats
       const endTime = Date.now();
@@ -3026,14 +3486,164 @@ export default function App(){
       setStartTime(Date.now());
       setElapsed(0);
       
+      // console.log('🚀 Starting territory tracking...');
+      
       // Check if we already have location permission
       const { status } = await Location.getForegroundPermissionsAsync();
       if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Location permission is required');
+        // console.log('🔐 Requesting foreground location permission...');
+        const { status: newStatus } = await Location.requestForegroundPermissionsAsync();
+        if (newStatus !== 'granted') {
+          Alert.alert(
+            'Location Permission Required', 
+            'This app needs location access to track your territory. Please enable location permissions in Settings.',
+            [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Open Settings', onPress: () => Linking.openSettings() }
+            ]
+          );
+          setIsTracking(false);
+          isTrackingRef.current = false;
         return;
+        }
+      }
+      
+              // console.log('✅ Foreground permission granted, requesting background...');
+      
+      // Request background location permission if not already granted
+      await requestBackgroundLocationPermission();
+      
+      // Start background location tracking
+      await startBackgroundLocationTracking();
+      
+      // On iOS, request background permission after tracking starts
+      if (Platform.OS === 'ios' && !backgroundLocationEnabled) {
+                  // console.log('🍎 iOS: Requesting background permission now that tracking has started...');
+        setTimeout(async () => {
+          try {
+            const { status: backgroundStatus } = await Location.getBackgroundPermissionsAsync();
+            if (backgroundStatus !== 'granted') {
+              const { status: newBackgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+              if (newBackgroundStatus === 'granted') {
+                // console.log('✅ iOS background permission granted!');
+                setBackgroundLocationEnabled(true);
+                await startBackgroundLocationTracking();
+              } else {
+                // console.log('⚠️ iOS background permission denied');
+              }
+            }
+          } catch (error) {
+            // console.log('❌ iOS background permission request failed:', error.message);
+          }
+        }, 2000); // Wait 2 seconds after tracking starts
+      }
+      
+      // Start pedometer tracking for steps and calories
+      if (pedometerAvailable) {
+        try {
+          // Reset session counters
+          setSessionSteps(0);
+          setSessionCalories(0);
+          setLastStepCount(0);
+          
+          // Load today's existing steps from database to continue counting
+          try {
+            const today = new Date().toISOString().split('T')[0];
+            const { data: existingData } = await supabase
+              .from('daily_fitness')
+              .select('steps, calories_burned')
+              .eq('user_id', user?.id)
+              .eq('date', today)
+              .single();
+            
+            if (existingData && existingData.steps > 0) {
+              // console.log('👟 Loading existing steps for today:', existingData.steps);
+              setDailySteps(existingData.steps);
+              setDailyCalories(existingData.calories_burned || 0);
+              setLastStepCount(existingData.steps);
+              lastStepCountRef.current = existingData.steps;
+                        // Set a flag to indicate we're continuing from existing steps
+          // console.log('👟 Continuing from existing steps, will wait for pedometer baseline');
+            } else {
+                              // console.log('👟 Starting fresh step count from 0');
+              setDailySteps(0);
+              setLastStepCount(0);
+              lastStepCountRef.current = 0;
+            }
+          } catch (error) {
+            // console.log('👟 Could not load existing steps, starting fresh:', error.message);
+            setDailySteps(0);
+            setLastStepCount(0);
+            lastStepCountRef.current = 0;
+          }
+          
+          // Start pedometer subscription with more robust error handling
+          const subscription = Pedometer.watchStepCount((result) => {
+            // console.log('👟 Pedometer update received:', result);
+            if (isTrackingRef.current && result && result.steps !== null && result.steps !== undefined) {
+              const currentSteps = result.steps;
+              const previousSteps = lastStepCountRef.current || 0;
+              const newSteps = currentSteps - previousSteps;
+              
+              // Handle step counting logic
+              if (previousSteps === 0) {
+                // First time starting - just set the initial values without counting as new steps
+                // console.log('👟 Initial pedometer reading:', currentSteps, '- setting baseline');
+                setDailySteps(currentSteps);
+                setLastStepCount(currentSteps);
+                lastStepCountRef.current = currentSteps;
+              } else if (newSteps > 0) {
+                // New steps detected - use the actual pedometer total
+                // console.log('👟 New steps detected:', newSteps, 'Total today:', currentSteps);
+                
+                setSessionSteps(prev => prev + newSteps);
+                setDailySteps(currentSteps); // Use actual pedometer total
+                
+                // Calculate calories based on steps (rough estimate: 1 step = 0.04 calories)
+                // Use Math.ceil to ensure small step counts still give calories
+                const newCalories = Math.ceil(newSteps * 0.04);
+                setSessionCalories(prev => prev + newCalories);
+                setDailyCalories(prev => prev + newCalories);
+                
+                // Update database with the actual pedometer total
+                updateDailyFitness(currentSteps, dailyCalories + newCalories);
+                
+                // console.log('👟 Updated - Session:', sessionSteps + newSteps, 'Daily:', currentSteps, 'New Calories:', newCalories);
+                setLastStepCount(currentSteps);
+                lastStepCountRef.current = currentSteps;
+              } else if (newSteps === 0) {
+                // No new steps - just update the reference to current pedometer value
+                // console.log('👟 No new steps, updating reference to:', currentSteps);
+                setLastStepCount(currentSteps);
+                lastStepCountRef.current = currentSteps;
+              }
+            }
+          });
+          
+          setPedometerSubscription(subscription);
+          // console.log('👟 Pedometer tracking started successfully');
+        } catch (pedometerError) {
+          console.log('⚠️ Pedometer error:', pedometerError.message);
+        }
+      } else {
+        console.log('⚠️ Pedometer not available, using fallback step counting');
       }
       
       // OPTIMIZATION: Set up location interval - collect points every 5 seconds with local caching
+      // Android performance: Use longer intervals on Android for better performance
+      const locationInterval = 5000; // 5 seconds for all platforms
+      
+      // Also set up a step count verification interval (every 10 seconds)
+      stepCheckIntervalRef.current = setInterval(async () => {
+        if (!isTrackingRef.current || !pedometerAvailable) return;
+        
+        try {
+          // Just log current state for debugging - don't try to get steps from date range
+          // console.log('👟 Step check interval - current state - Session:', sessionSteps, 'Daily:', dailySteps);
+        } catch (stepError) {
+          console.log('⚠️ Step check interval error:', stepError.message);
+        }
+      }, 10000); // Check every 10 seconds
       locationIntervalRef.current = setInterval(async () => {
         if (!isTrackingRef.current) return;
         
@@ -3069,8 +3679,30 @@ export default function App(){
               // Skip invalid coordinates silently for performance
             }
             
-            // Update fitness tracking (steps and calories)
-            simulateFitnessTracking();
+            // Fallback step counting if pedometer isn't working
+            if (!pedometerAvailable || sessionSteps === 0) {
+              // Estimate steps based on distance moved (roughly 1 step per 0.5 meters)
+              const distanceMoved = points.length > 1 ? 
+                haversine(points[points.length - 2], points[points.length - 1]) : 0;
+              
+              if (distanceMoved > 0.3) { // Only count if moved more than 30cm
+                const estimatedSteps = Math.max(1, Math.round(distanceMoved / 0.5));
+                setSessionSteps(prev => prev + estimatedSteps);
+                
+                // For fallback, we need to get the current daily total and add to it
+                const currentDailyTotal = dailySteps + estimatedSteps;
+                setDailySteps(currentDailyTotal);
+                
+                const estimatedCalories = Math.round(estimatedSteps * 0.04);
+                setSessionCalories(prev => prev + estimatedCalories);
+                setDailyCalories(prev => prev + estimatedCalories);
+                
+                // Update database
+                updateDailyFitness(currentDailyTotal, dailyCalories + estimatedCalories);
+                
+                // console.log('👟 Fallback step counting:', estimatedSteps, 'steps from', distanceMoved.toFixed(2), 'm movement');
+              }
+            }
             
             // Don't update main claimed cells here - let fetchCells handle it
             // This prevents duplicates between local and database cells
@@ -3078,12 +3710,278 @@ export default function App(){
         } catch (error) {
           // Silently handle error for production
         }
-      }, 5000);
+      }, locationInterval);
       
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+              // console.log('🎉 Territory tracking started successfully!');
       
     } catch (e) {
+      console.log('❌ Failed to start tracking:', e.message);
       Alert.alert('Error', 'Failed to start tracking: ' + e.message);
+      setIsTracking(false);
+      isTrackingRef.current = false;
+    }
+  };
+  
+  // Background location tracking functions
+  const requestBackgroundLocationPermission = async () => {
+    try {
+      // console.log('🔐 Requesting location permissions...');
+      
+      // Check current permission status
+      const { status: foregroundStatus } = await Location.getForegroundPermissionsAsync();
+              // console.log('📱 Foreground permission status:', foregroundStatus);
+      
+      if (foregroundStatus !== 'granted') {
+        // console.log('🔐 Requesting foreground permission...');
+        const { status: newStatus } = await Location.requestForegroundPermissionsAsync();
+        if (newStatus !== 'granted') {
+          throw new Error('Foreground location permission denied');
+        }
+        // console.log('✅ Foreground permission granted');
+      }
+      
+      // On iOS, we need to wait for the user to start tracking before requesting background
+      // This is because iOS only shows "Always" option after the app has been used
+      if (Platform.OS === 'ios') {
+                  // console.log('📱 iOS detected - background permission will be requested when tracking starts');
+        setBackgroundLocationEnabled(false);
+        return;
+      }
+      
+      // Try to request background location permission (Android)
+      try {
+        const { status: backgroundStatus } = await Location.getBackgroundPermissionsAsync();
+        // console.log('📱 Background permission status:', backgroundStatus);
+        
+        if (backgroundStatus !== 'granted') {
+          // console.log('🔐 Requesting background permission...');
+          const { status: newBackgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+          if (newBackgroundStatus !== 'granted') {
+            // console.log('⚠️ Background permission not granted, but foreground tracking will work');
+            setBackgroundLocationEnabled(false);
+            
+            // Show guidance to user
+            setTimeout(() => {
+              showPermissionGuidance();
+            }, 1000);
+            
+            return;
+          }
+          // console.log('✅ Background permission granted');
+        }
+        
+        setBackgroundLocationEnabled(true);
+        setLocationPermissionStatus('granted');
+                  // console.log('🎉 All location permissions granted!');
+        
+      } catch (backgroundError) {
+        // console.log('⚠️ Background permission request failed, using foreground only:', backgroundError.message);
+        setBackgroundLocationEnabled(false);
+        
+        // Show guidance to user
+        setTimeout(() => {
+          showPermissionGuidance();
+        }, 1000);
+      }
+      
+    } catch (error) {
+      console.log('❌ Location permission request failed:', error.message);
+      setBackgroundLocationEnabled(false);
+      
+      // Show guidance to user
+      setTimeout(() => {
+        showPermissionGuidance();
+      }, 1000);
+    }
+  };
+  
+  const startBackgroundLocationTracking = async () => {
+    try {
+      if (!backgroundLocationEnabled) {
+        // console.log('⚠️ Background location not enabled, using foreground tracking only');
+        return; // Skip if background location not enabled
+      }
+      
+      console.log('🚀 Starting background location tracking...');
+      
+      // Configure background location options
+      const locationOptions = {
+        accuracy: Location.Accuracy.Balanced,
+        timeInterval: Platform.OS === 'android' ? 5000 : 3000, // 5s Android, 3s iOS
+        distanceInterval: Platform.OS === 'android' ? 10 : 5, // 10m Android, 5m iOS
+        showsBackgroundLocationIndicator: Platform.OS === 'ios', // Blue bar on iOS
+        foregroundService: {
+          notificationTitle: 'Clash of Trails',
+          notificationBody: 'Tracking your territory...',
+          notificationColor: '#6aa2ff',
+        },
+        // Android-specific options
+        android: {
+          notificationTitle: 'Clash of Trails',
+          notificationText: 'Tracking your territory...',
+          notificationColor: '#6aa2ff',
+          notificationIcon: 'ic_notification',
+        }
+      };
+      
+              // console.log('📱 Location options configured:', locationOptions);
+      
+      // Start background location updates
+      locationSubscriptionRef.current = await Location.watchPositionAsync(
+        locationOptions,
+        (location) => {
+          if (isTrackingRef.current && location) {
+            console.log('📍 Background location update:', {
+              lat: location.coords.latitude.toFixed(6),
+              lon: location.coords.longitude.toFixed(6),
+              accuracy: location.coords.accuracy?.toFixed(1)
+            });
+            
+            const newPoint = {
+              lat: location.coords.latitude,
+              lon: location.coords.longitude,
+              timestamp: Date.now()
+            };
+            
+            // Update points even when app is in background
+            setPoints(prev => [...prev, newPoint]);
+            
+            // Process hexagon locally
+            try {
+              const cell = h3.latLngToCell(newPoint.lat, newPoint.lon, H3_RES);
+              setLocalClaimedHexes(prev => {
+                if (!prev.has(cell)) {
+                  return new Set([...prev, cell]);
+                }
+                return prev;
+              });
+            } catch (hexError) {
+              // Skip invalid coordinates silently
+            }
+            
+            // Fitness tracking is now handled by pedometer
+          }
+        }
+      );
+      
+              // console.log('✅ Background location tracking started successfully!');
+      
+    } catch (error) {
+              // console.log('❌ Background location tracking failed, falling back to foreground only:', error.message);
+      setBackgroundLocationEnabled(false);
+      
+      // Show user-friendly message
+      Alert.alert(
+        'Background Tracking Unavailable',
+        'Background location tracking is not available on this device. Territory tracking will continue while the app is open.',
+        [{ text: 'OK', style: 'default' }]
+      );
+    }
+  };
+  
+  const stopBackgroundLocationTracking = async () => {
+    try {
+      if (locationSubscriptionRef.current) {
+        await locationSubscriptionRef.current.remove();
+        locationSubscriptionRef.current = null;
+      }
+      
+      setBackgroundLocationEnabled(false);
+      
+    } catch (error) {
+      console.log('Failed to stop background location tracking:', error.message);
+    }
+  };
+  
+  // Handle app termination to ensure tracking stops
+  const handleAppTermination = useCallback(async () => {
+    if (isTracking) {
+      console.log('🚨 App terminating - stopping tracking and uploading pending data');
+      
+      // Stop background tracking
+      await stopBackgroundLocationTracking();
+      
+      // Clear intervals
+      if (locationIntervalRef.current) {
+        clearInterval(locationIntervalRef.current);
+        locationIntervalRef.current = null;
+      }
+      
+      // Upload any pending data if possible
+      if (points.length > 0 && user?.id) {
+        try {
+          // Quick upload of current points before app closes
+          await uploadPendingData();
+        } catch (error) {
+          console.log('Failed to upload pending data on termination:', error.message);
+        }
+      }
+    }
+  }, [isTracking, points.length, user?.id]);
+  
+  // Upload pending data function
+  const uploadPendingData = async () => {
+    if (!points.length || !user?.id || !activeGroupId) return;
+    
+    try {
+      // Convert points to hexagons
+      const hexagonsToProcess = new Set();
+      points.forEach(point => {
+        try {
+          const cell = h3.latLngToCell(point.lat, point.lon, H3_RES);
+          hexagonsToProcess.add(cell);
+    } catch (e) {
+          // Skip invalid coordinates
+        }
+      });
+      
+      const uniqueHexagons = Array.from(hexagonsToProcess);
+      
+      if (uniqueHexagons.length === 0) return;
+      
+      // Quick claim of hexagons
+      const claims = uniqueHexagons.map(hexId => ({
+        h3_id: hexId,
+        user_id: user.id,
+        group_id: activeGroupId,
+        claimed_at: new Date().toISOString()
+      }));
+      
+      // Upload to database
+      const { error } = await supabase
+        .from('captured_cells')
+        .upsert(claims);
+      
+      if (!error) {
+        // console.log('✅ Pending data uploaded successfully');
+      }
+      
+    } catch (error) {
+      console.log('Failed to upload pending data:', error.message);
+    }
+  };
+  
+  // Enhanced permission guidance for users
+  const showPermissionGuidance = () => {
+    if (Platform.OS === 'ios') {
+      Alert.alert(
+        'Background Location Access',
+        'To enable background tracking on iOS:\n\n1. First select "While Using the App"\n2. Then return to the app and start tracking\n3. iOS will ask for "Always" permission\n4. Select "Allow Always" when prompted\n\nThis enables tracking even when the app is minimized!',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open Settings', onPress: () => Linking.openSettings() }
+        ]
+      );
+    } else {
+      Alert.alert(
+        'Background Location Access',
+        'To track territory while the app is minimized:\n\n1. Go to Settings > Apps > Clash of Trails > Permissions\n2. Enable "Location" and "Background location"\n3. Return to the app and try again',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open Settings', onPress: () => Linking.openSettings() }
+        ]
+      );
     }
   };
 
@@ -3092,13 +3990,10 @@ export default function App(){
   const mm=String(Math.floor((secs%3600)/60)).padStart(2,'0');
   const ss=String(secs%60).padStart(2,'0');
 
-  /* ----- live tracking polygons only - OPTIMIZED with local caching ----- */
-  const livePolygons = useMemo(()=>{
-    if (!isTracking || points.length === 0) return [];
-    
+  // Helper function to process polygons - extracted for better performance
+  const processPolygons = useCallback((points, baseColor) => {
     // Use Set for O(1) duplicate checking instead of O(n) array operations
     const uniqueHexIds = new Set(); 
-      const base = profile?.color || '#6aa2ff';
     
     // Process points in a single pass for better performance
     const result = [];
@@ -3108,14 +4003,14 @@ export default function App(){
         if (!uniqueHexIds.has(hexId)) {
           uniqueHexIds.add(hexId);
           
-          const coords = polygonFromCell(hexId);
+      const coords = polygonFromCell(hexId);
           if (coords) {
             result.push({ 
               id: `live-${hexId}`, 
         coords, 
-              fill: rgba(base, 0.7),
-              stroke: rgba(base, 1.0),
-              strokeWidth: 4,
+              fill: rgba(baseColor, 0.7),
+              stroke: rgba(baseColor, 1.0),
+              strokeWidth: 4, // Consistent stroke width
         type: 'live'
             });
           }
@@ -3127,7 +4022,21 @@ export default function App(){
     }
     
     return result;
-  },[isTracking, profile?.color, points]);
+  }, []);
+  
+  /* ----- live tracking polygons only - OPTIMIZED with local caching ----- */
+  const livePolygons = useMemo(()=>{
+    if (!isTracking || points.length === 0) return [];
+    
+    // Performance: Limit points for all platforms if too many
+    if (points.length > 50) {
+      // Only show last 50 points for better performance
+      const limitedPoints = points.slice(-50);
+      return processPolygons(limitedPoints, profile?.color || '#6aa2ff');
+    }
+    
+    return processPolygons(points, profile?.color || '#6aa2ff');
+  }, [isTracking, points, profile?.color]);
 
   // All hexagons with proper styling based on status - OPTIMIZED with local caching
   const allHexPolygons = useMemo(() => {
@@ -3140,143 +4049,17 @@ export default function App(){
       return [];
     }
     
-    // Create lookup maps for O(1) access instead of O(n) searches
-    const cellsMap = new Map(cells.map(c => [c.h3_id, c]));
-    const claimedSet = new Set(claimedCells);
-    const localClaimedSet = new Set(localClaimedHexes);
+    // Performance: Only limit if absolutely necessary
+    if (allHexGrid.size > 1000) {
+      // Only limit if we have way too many hexagons
+      const limitedHexGrid = new Set(Array.from(allHexGrid).slice(-500));
+      return processAllHexagons(limitedHexGrid, cells, claimedCells, localClaimedHexes, sharedHexagons, user, profile);
+    }
     
-    // Check if this hexagon is shared between multiple users
-    const isHexShared = (hexId) => {
-      const sharedUsers = sharedHexagons.get(hexId);
-      const isShared = sharedUsers && sharedUsers.length > 1;
-        return isShared;
-      };
-    
-    const result = Array.from(allHexGrid).map(hexId => {
-      if (!hexId) return null;
-      
-      // Generate coordinates for this hex
-      const coords = polygonFromCell(hexId);
-      if (!coords) return null;
-      
-       const isClaimed = claimedSet.has(hexId);
-       const isLocalClaimed = localClaimedSet.has(hexId);
-       
-       // O(1) lookup instead of O(n) search
-       const ownerCell = cellsMap.get(hexId);
-       const isOwned = !!ownerCell;
-       const isMine = ownerCell?.user_id === user?.id;
-      
+    return processAllHexagons(allHexGrid, cells, claimedCells, localClaimedHexes, sharedHexagons, user, profile);
+  }, [allHexGrid, cells, claimedCells, localClaimedHexes, sharedHexagons, user, profile, mapConfig.maxPolygons]);
+  
 
-      
-
-      
-      // Priority: Local Claimed > Claimed > Owned > Unclaimed
-      if (isLocalClaimed) {
-        // Locally claimed while walking - most prominent with pulsing effect
-        const base = profile?.color || '#6aa2ff';
-
-        
-        return {
-          id: hexId,
-          coords: coords,
-            fill: Platform.OS === 'android' ? androidColor(base, 0.8) : rgba(base, 0.8), // Very opaque for local claims
-            stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 1.0), // Solid border
-            strokeWidth: Platform.OS === 'android' ? 5 : 4, // Thicker border for Android
-            type: 'local-claimed',
-            subtype: 'walking'
-          };
-      } else if (isOwned) {
-                // Check if this is a shared hexagon first
-        if (isHexShared(hexId)) {
-          // Shared territory - use unique purple/magenta color that no user can have
-          const sharedUsers = sharedHexagons.get(hexId);
-          const isMySharedTerritory = sharedUsers.includes(user?.id);
-          
-        return {
-          id: hexId,
-          coords: coords,
-            fill: Platform.OS === 'android' 
-              ? 'rgba(128, 0, 128, 0.7)' // Unique purple/magenta for shared territory on Android
-              : 'rgba(128, 0, 128, 0.6)', // Unique purple/magenta for shared territory on iOS
-            stroke: Platform.OS === 'android'
-              ? 'rgba(128, 0, 128, 1.0)' // Solid purple/magenta border on Android
-              : 'rgba(128, 0, 128, 0.9)', // Solid purple/magenta border on iOS
-            strokeWidth: 4, // Thicker border for shared territory
-            type: 'shared',
-            subtype: isMySharedTerritory ? 'mine-shared' : 'other-shared',
-            sharedUsers: sharedUsers,
-            primaryOwner: ownerCell?.user_id,
-            ownerColor: ownerCell?.userColor || '#6aa2ff'
-          };
-        }
-        
-        // Regular owned territory (not shared) - use the ACTUAL owner's color
-        const ownerColor = ownerCell?.userColor;
-        
-        const base = ownerColor || '#6aa2ff'; // Fallback to blue if no color
-        const isMyTerritory = ownerCell?.user_id === user?.id;
-        
-        if (isMyTerritory) {
-          // My territory - solid and prominent
-        return {
-          id: hexId,
-          coords: coords,
-           fill: Platform.OS === 'android' ? androidColor(base, 0.7) : rgba(base, 0.6), // More opaque for my territory on Android
-           stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 1.0), // Solid border
-           strokeWidth: Platform.OS === 'android' ? 4 : 3, // Thicker border for Android
-          type: 'owned',
-          subtype: 'mine',
-           owner: ownerCell?.user_id,
-           ownerColor: base
-         };
-        } else {
-          // Other player's territory - use THEIR color
-        return {
-          id: hexId,
-          coords: coords,
-           fill: Platform.OS === 'android' ? androidColor(base, 0.5) : rgba(base, 0.3), // More visible on Android
-           stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 0.9), // Strong border in their color
-           strokeWidth: Platform.OS === 'android' ? 3.5 : 2.5, // Thicker border for Android
-          type: 'owned',
-          subtype: 'other',
-           owner: ownerCell?.user_id,
-           ownerColor: base
-         };
-        }
-      } else if (isClaimed) {
-        // Fallback for claimed cells that aren't in database yet
-        const base = profile?.color || '#6aa2ff';
-
-        return {
-          id: hexId,
-          coords: coords,
-          fill: Platform.OS === 'android' ? androidColor(base, 0.6) : rgba(base, 0.5), // Medium opacity
-          stroke: Platform.OS === 'android' ? androidStrokeColor(base, 1.0) : rgba(base, 0.8), // Medium border
-          strokeWidth: Platform.OS === 'android' ? 3 : 2, // Medium border thickness
-          type: 'claimed',
-          subtype: 'fallback'
-        };
-      } else {
-        // Unclaimed - neutral but visible
-
-        return {
-          id: hexId,
-          coords: coords,
-          fill: Platform.OS === 'android' 
-            ? (theme.isDark ? 'rgba(100, 110, 130, 0.3)' : 'rgba(200, 210, 230, 0.4)') // Android rgba
-            : (theme.isDark ? 'rgba(100, 110, 130, 0.2)' : 'rgba(200, 210, 230, 0.3)'), // iOS rgba
-          stroke: Platform.OS === 'android'
-            ? (theme.isDark ? 'rgba(160, 170, 190, 0.9)' : 'rgba(140, 150, 170, 0.9)') // Android rgba
-            : (theme.isDark ? 'rgba(160, 170, 190, 0.8)' : 'rgba(140, 150, 170, 0.8)'), // iOS rgba
-          strokeWidth: 1.5, // Slightly thicker for visibility
-          type: 'unclaimed'
-        };
-      }
-    }).filter(Boolean);
-    
-    return result;
-  }, [allHexGrid, claimedCells, localClaimedHexes, cells, profile?.color, theme.isDark, user?.id, sharedHexagons]);
     
     
 
@@ -3475,20 +4258,7 @@ export default function App(){
       }]} />
       <View style={{ paddingTop: Platform.OS === 'android' ? 25 : 0 }}>
         {/* OTA Update Notification */}
-        {updateAvailable && (
-          <View style={[styles.updateNotification, { backgroundColor: theme.primary, borderColor: theme.border }]}>
-            <Text style={styles.updateNotificationText}>🔄 Update Available!</Text>
-            <Pressable 
-              onPress={applyUpdate}
-              disabled={isCheckingUpdate}
-              style={[styles.updateButton, { backgroundColor: theme.bg }]}
-            >
-              <Text style={[styles.updateButtonText, { color: theme.primary }]}>
-                {isCheckingUpdate ? 'Updating...' : 'Update Now'}
-              </Text>
-            </Pressable>
-          </View>
-        )}
+        {renderOTAUpdateNotification()}
         
         <BrandHeader 
           subtitle={activeGroupId ? `Group: ${groups.find(g => g.id === activeGroupId)?.name || 'Group'}` : 'Map Your Trails ⚔️'} 
@@ -3522,7 +4292,12 @@ export default function App(){
             hexagons={[...allHexPolygons, ...livePolygons]}
             onRegionChange={(region) => {
               if (region && region.latitude && region.longitude) {
+                // Performance: Consistent grid expansion across platforms
+                const now = Date.now();
+                if (now - lastGridUpdateRef.current > 1000) { // 1 second throttle for all platforms
+                  lastGridUpdateRef.current = now;
                 checkAndExpandGrid(region.latitude, region.longitude);
+                }
               }
             }}
           />
@@ -3774,6 +4549,8 @@ export default function App(){
                     <PrimaryButton theme={theme} title="Start" onPress={startWatching} disabled={isTracking} />
                     <GhostButton theme={theme} title="Stop" onPress={stopWatching} />
                   </View>
+                  
+
 
                   <View style={styles.statRow}>
                     <View style={[styles.statCard, { backgroundColor: theme.isDark ? '#0f1324' : '#f2f4ff', borderColor: theme.border }]}>
@@ -3845,9 +4622,76 @@ export default function App(){
                       )}
                     </View>
                   </View>
+                                    )}
+                  
+                  {/* Debug pedometer info */}
+                  {pedometerAvailable && (
+                    <View style={styles.statRow}>
+                      <View style={[styles.statCard, { 
+                        backgroundColor: theme.isDark ? '#1a1f2e' : '#e8f0ff', 
+                        borderColor: theme.primary, 
+                        flex: 1,
+                        alignItems: 'center',
+                        minHeight: 60,
+                        justifyContent: 'center'
+                      }]}>
+                        <Text style={[styles.statLabel, { color: theme.primary, fontSize: 12, fontWeight: '600' }]}>
+                          📱 Pedometer Status
+                        </Text>
+                        <Text style={[styles.statValue, { color: theme.text, fontSize: 14, fontWeight: '600', marginTop: 2 }]}>
+                          {isTracking ? 'Active' : 'Ready'}
+                        </Text>
+                        <Text style={[styles.statLabel, { color: theme.sub, fontSize: 10, marginTop: 2 }]}>
+                          Last: {lastStepCount} steps
+                        </Text>
+                      </View>
+                    </View>
                   )}
                   
-
+                  {/* Session stats - only show when tracking */}
+                  {isTracking && (
+                    <View style={styles.statRow}>
+                      <View style={[styles.statCard, { 
+                        backgroundColor: theme.isDark ? '#1a1f2e' : '#e8f0ff', 
+                        borderColor: theme.primary, 
+                        flex: 1,
+                        alignItems: 'center',
+                        minHeight: 80,
+                        justifyContent: 'center'
+                      }]}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          <Text style={{ fontSize: 16 }}>🎯</Text>
+                          <Text style={[styles.statLabel, { color: theme.primary, fontSize: 14, fontWeight: '600' }]}>Session</Text>
+                        </View>
+                        <Text style={[styles.statValue, { color: theme.text, fontSize: 20, fontWeight: '800', marginTop: 4 }]}>
+                          {sessionSteps.toLocaleString()}
+                        </Text>
+                        <Text style={[styles.statLabel, { color: theme.sub, fontSize: 10, marginTop: 2 }]}>
+                          Steps this session
+                        </Text>
+                      </View>
+                      
+                      <View style={[styles.statCard, { 
+                        backgroundColor: theme.isDark ? '#1a1f2e' : '#e8f0ff', 
+                        borderColor: theme.primary, 
+                        flex: 1,
+                        alignItems: 'center',
+                        minHeight: 80,
+                        justifyContent: 'center'
+                      }]}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          <Text style={{ fontSize: 16 }}>⚡</Text>
+                          <Text style={[styles.statLabel, { color: theme.primary, fontSize: 14, fontWeight: '600' }]}>Session</Text>
+                        </View>
+                        <Text style={[styles.statValue, { color: theme.text, fontSize: 20, fontWeight: '800', marginTop: 4 }]}>
+                          {sessionCalories.toLocaleString()}
+                        </Text>
+                        <Text style={[styles.statLabel, { color: theme.sub, fontSize: 10, marginTop: 2 }]}>
+                          Calories this session
+                        </Text>
+                      </View>
+                    </View>
+                  )}
                   
                   {/* Shared hexagons indicator */}
                   {sharedHexagons.size > 0 && (
@@ -4357,7 +5201,22 @@ const styles = StyleSheet.create({
   formRow:{ marginTop:16 },
   rowGap:{ marginTop:20, gap:12 },
 
-  buttonPrimary:{ paddingVertical:16, borderRadius:18, alignItems:'center', shadowColor:'#000', shadowOpacity:0.15, shadowRadius:6, shadowOffset:{width:0,height:3}, elevation: 4, position: 'relative', overflow: 'hidden' },
+  buttonPrimary:{ 
+    paddingVertical:16, 
+    borderRadius:18, 
+    alignItems:'center', 
+    shadowColor:'#000', 
+    shadowOpacity: Platform.OS === 'android' ? 0.1 : 0.15, // Reduced shadow for Android
+    shadowRadius: Platform.OS === 'android' ? 4 : 6, // Reduced shadow radius for Android
+    shadowOffset:{width:0,height:3}, 
+    elevation: Platform.OS === 'android' ? 6 : 4, // Higher elevation for Android
+    position: 'relative', 
+    overflow: 'hidden',
+    // Android performance optimizations
+    ...(Platform.OS === 'android' && {
+      backgroundColor: Platform.OS === 'android' ? '#6aa2ff' : undefined, // Solid background for Android
+    })
+  },
   buttonPrimaryText:{ color:'#fff', fontWeight:'700', fontSize:16, letterSpacing: 0.3 },
   buttonPrimaryGradient: {
     position: 'absolute',
@@ -4371,6 +5230,76 @@ const styles = StyleSheet.create({
   buttonPrimaryText:{ color:'white', fontWeight:'800', fontSize:17, letterSpacing: 0.5 },
   buttonGhost:{ paddingVertical:14, borderRadius:18, alignItems:'center', borderWidth:1, shadowColor:'#000', shadowOpacity:0.12, shadowRadius:6, shadowOffset:{width:0,height:3}, elevation: 4 },
   buttonGhostText:{ fontWeight:'700', fontSize:16, letterSpacing: 0.3 },
+  
+  // OTA Update Notification Styles
+  otaUpdateContainer: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 60 : 40,
+    left: 20,
+    right: 20,
+    zIndex: 1000,
+    borderRadius: 16,
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  otaUpdateContent: {
+    padding: 20,
+    alignItems: 'center',
+  },
+  otaUpdateTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  otaUpdateText: {
+    fontSize: 14,
+    marginBottom: 16,
+    textAlign: 'center',
+    opacity: 0.9,
+  },
+  updateProgressContainer: {
+    width: '100%',
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  updateProgressBar: {
+    width: '100%',
+    height: 6,
+    borderRadius: 3,
+    marginBottom: 8,
+    overflow: 'hidden',
+  },
+  updateProgressFill: {
+    height: '100%',
+    borderRadius: 3,
+    transition: 'width 0.3s ease',
+  },
+  updateProgressText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  updateButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 20,
+    minWidth: 120,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
+  updateButtonText: {
+    fontSize: 14,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
   
   coolButton:{ 
     alignItems: 'center', 
@@ -4607,9 +5536,52 @@ const styles = StyleSheet.create({
   },
 
 
-    drawerWrap:{ position:'absolute', top:0, bottom:0, left:0, width:'80%', backgroundColor:'#00000040', zIndex: 3000, elevation: 3000 },
-  drawerWrapRight:{ position:'absolute', top:0, bottom:0, right:0, width:'80%', backgroundColor:'#00000040', zIndex: 3000, elevation: 3000 },
-  drawer:{ flex:1, width:'100%', borderRightWidth:1, shadowColor:'#000', shadowOpacity:0.3, shadowRadius:20, shadowOffset:{width:0,height:0}, elevation: 3001, zIndex: 3001 },
+    drawerWrap:{ 
+    position:'absolute', 
+    top:0, 
+    bottom:0, 
+    left:0, 
+    width:'80%', 
+    backgroundColor:'#00000040', 
+    zIndex: 3000, 
+    elevation: 3000,
+    // Android performance optimizations
+    ...(Platform.OS === 'android' && {
+      backgroundColor: '#00000060', // Slightly more opaque for better performance
+      elevation: 3000
+    })
+  },
+  drawerWrapRight:{ 
+    position:'absolute', 
+    top:0, 
+    bottom:0, 
+    right:0, 
+    width:'80%', 
+    backgroundColor:'#00000040', 
+    zIndex: 3000, 
+    elevation: 3000,
+    // Android performance optimizations
+    ...(Platform.OS === 'android' && {
+      backgroundColor: '#00000060', // Slightly more opaque for better performance
+      elevation: 3000
+    })
+  },
+  drawer:{ 
+    flex:1, 
+    width:'100%', 
+    borderRightWidth:1, 
+    shadowColor:'#000', 
+    shadowOpacity: Platform.OS === 'android' ? 0.2 : 0.3, // Reduced shadow for Android
+    shadowRadius: Platform.OS === 'android' ? 15 : 20, // Reduced shadow radius for Android
+    shadowOffset:{width:0,height:0}, 
+    elevation: 3001, 
+    zIndex: 3001,
+    // Android performance optimizations
+    ...(Platform.OS === 'android' && {
+      backgroundColor: Platform.OS === 'android' ? '#ffffff' : undefined, // Solid background for Android
+      elevation: 3001
+    })
+  },
   drawerHeader:{ 
     paddingHorizontal:20, 
     paddingVertical:20, 
@@ -4651,7 +5623,26 @@ const styles = StyleSheet.create({
   
   // Floating Action Button Styles
   // Persistent Floating Button Styles - Super Cool Design with Premium Shadows
-  persistentButtonLeft:{ position:'absolute', top: Platform.select({ ios: 40, android: 60 }), left: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 1000 },
+  persistentButtonLeft:{ 
+    position:'absolute', 
+    top: Platform.select({ ios: 40, android: 60 }), 
+    left: 20, 
+    width: 56, 
+    height: 56, 
+    borderRadius: 28, 
+    shadowColor:'#000', 
+    shadowOpacity: Platform.OS === 'android' ? 0.3 : 0.5, // Reduced shadow for Android
+    shadowRadius: Platform.OS === 'android' ? 6 : 8, // Reduced shadow radius for Android
+    shadowOffset:{width:0,height:4}, 
+    elevation: Platform.OS === 'android' ? 12 : 10, // Higher elevation for Android
+    overflow: 'hidden', 
+    borderWidth: 2, 
+    zIndex: 1000,
+    // Android performance optimizations
+    ...(Platform.OS === 'android' && {
+      backgroundColor: Platform.OS === 'android' ? '#6aa2ff' : undefined, // Solid background for Android
+    })
+  },
   conquestModeButton:{ position:'absolute', top: Platform.select({ ios: 110, android: 130 }), left: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 1000 },
   persistentButtonRightTop:{ position:'absolute', top: Platform.select({ ios: 40, android: 60 }), right: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 100 },
   persistentButtonRightBottom:{ position:'absolute', top: Platform.select({ ios: 110, android: 130 }), right: 20, width: 56, height: 56, borderRadius: 28, shadowColor:'#000', shadowOpacity:0.5, shadowRadius:8, shadowOffset:{width:0,height:4}, elevation: 10, overflow: 'hidden', borderWidth: 2, zIndex: 100 },

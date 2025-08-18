@@ -14,10 +14,10 @@ try {
   // Change to the project directory
   process.chdir(path.join(__dirname));
   
-  console.log('📱 Publishing update to Expo...');
+  console.log('📱 Publishing update to EAS...');
   
-  // Publish the update
-  execSync('npx expo publish', { 
+  // Publish the update using EAS (replaces expo publish)
+  execSync('npx eas update --branch preview --message "Fix Android hex rendering issues"', { 
     stdio: 'inherit',
     env: { ...process.env, FORCE_COLOR: '1' }
   });
@@ -32,7 +32,7 @@ try {
   console.log('   - Made your code changes');
   console.log('   - Saved all files');
   console.log('   - Have internet connection');
-  console.log('   - Are logged into Expo (run: npx expo login)');
+  console.log('   - Are logged into EAS (run: npx eas login)');
   
   process.exit(1);
 }
